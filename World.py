@@ -4,10 +4,12 @@ from Civilization import Person
 from Animal import Animal
 
 class World:
-    def __init__(self, width, height):
+    def __init__(self, width, height, population_cap=10):
         self.width = width
         self.height = height
         self.grid = [[Tile('grass') for _ in range(width)] for _ in range(height)]
+        self.people = []          # all living + dead tracked here; dead pruned each tick
+        self.population_cap = population_cap
         self.generate_terrain()
         self.spawn_animals()
 
@@ -24,7 +26,7 @@ class World:
 
         # hidden food
         food_count = 0
-        while food_count < 30:
+        while food_count < 120:
             x = random.randint(0, self.width - 1)
             y = random.randint(0, self.height - 1)
             if self.grid[y][x].terrain == 'grass':
@@ -33,12 +35,25 @@ class World:
 
         # hidden seeds
         seed_count = 0
-        while seed_count < 20:
+        while seed_count < 70:
             x = random.randint(0, self.width - 1)
             y = random.randint(0, self.height - 1)
             if self.grid[y][x].terrain == 'grass':
                 self.grid[y][x].terrain = 'seed'
                 seed_count += 1
+
+    def seed_food_near(self, cx, cy, radius=6, count=8):
+        """Guarantee some food tiles near a spawn point so early game isn't a death race."""
+        placed = 0
+        attempts = 0
+        while placed < count and attempts < 500:
+            x = cx + random.randint(-radius, radius)
+            y = cy + random.randint(-radius, radius)
+            if 0 <= x < self.width and 0 <= y < self.height:
+                if self.grid[y][x].terrain == 'grass':
+                    self.grid[y][x].terrain = 'food'
+                    placed += 1
+            attempts += 1
 
     def grow_farms(self):
         for row in self.grid:
@@ -49,7 +64,7 @@ class World:
                         tile.terrain = 'ready'
                         tile.grow_timer = 0
 
-    def spawn_animals(self, count=5):
+    def spawn_animals(self, count=12):
         self.animals = []
         spawned = 0
         attempts = 0
@@ -65,7 +80,7 @@ class World:
 
     def respawn_animals(self):
         alive = sum(1 for a in self.animals if a.isAlive)
-        if alive < 3:
+        if alive < 6:
             attempts = 0
             while attempts < 1000:
                 x = random.randint(0, self.width - 1)
@@ -83,14 +98,30 @@ class World:
                 if animal.isAlive:
                     animal.move(self)
 
-    def spawn_person(self, name):
-        while True:
+    def spawn_person(self, name, intelligence=10):
+        attempts = 0
+        while attempts < 1000:
             x = random.randint(0, self.width - 1)
             y = random.randint(0, self.height - 1)
             if self.grid[y][x].terrain == 'grass' and self.grid[y][x].civilization is None:
-                person = Person(name, x, y)
+                person = Person(name, x, y, intelligence=intelligence)
                 self.grid[y][x].civilization = person
+                self.people.append(person)
                 return person
+            attempts += 1
+        raise RuntimeError("Could not find a free tile to spawn person")
+
+    def prune_dead(self):
+        """Remove dead people from the grid and people list."""
+        alive = []
+        for p in self.people:
+            if p.isAlive:
+                alive.append(p)
+            else:
+                # Clear their tile if they're still on it
+                if self.grid[p.y][p.x].civilization is p:
+                    self.grid[p.y][p.x].civilization = None
+        self.people = alive
 
     def display(self):
         for row in self.grid:
