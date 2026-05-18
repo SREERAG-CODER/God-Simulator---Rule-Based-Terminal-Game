@@ -1,4 +1,5 @@
 import random
+from collections import deque
 
 class Person:
     def __init__(self, name, x, y):
@@ -45,11 +46,9 @@ class Person:
 
     # --- Eating ---
     def try_eat(self):
-        # eat if hunger below 30 OR health below 30
         if self.hunger > 30 and self.health >= 30:
             return
 
-        # priority: harvested → food → meat
         if self.has_item('harvested'):
             self.remove_item('harvested')
             self.hunger = min(100, self.hunger + 50)
@@ -67,8 +66,6 @@ class Person:
             self.hunger = min(100, self.hunger + 80)
             self.health = min(100, self.health + 20)
             return
-
-        # seeds are NEVER eaten
 
     # --- Hunger & Health ---
     def update_hunger(self, tick):
@@ -94,6 +91,51 @@ class Person:
             if tick % 30 == 0:
                 self.intelligence += 5
 
+    # --- BFS Pathfinder ---
+    def _find_path_step(self, world, target_x, target_y):
+        """
+        BFS from current position to (target_x, target_y).
+        Returns the (dx, dy) of the first step along the shortest
+        walkable path, or None if no path exists.
+        Water is never passable. The target tile itself is allowed
+        even if currently occupied (so we can step onto an animal
+        or a ready crop tile).
+        """
+        if self.x == target_x and self.y == target_y:
+            return None
+
+        queue = deque()
+        queue.append((self.x, self.y, []))
+        visited = {(self.x, self.y)}
+
+        while queue:
+            cx, cy, path = queue.popleft()
+            for dx, dy in [(0, -1), (0, 1), (-1, 0), (1, 0)]:
+                nx, ny = cx + dx, cy + dy
+                if not (0 <= nx < world.width and 0 <= ny < world.height):
+                    continue
+                if (nx, ny) in visited:
+                    continue
+
+                tile = world.grid[ny][nx]
+                at_target = (nx == target_x and ny == target_y)
+                passable = (
+                    tile.terrain != 'water' and
+                    (tile.civilization is None or at_target)
+                )
+                if not passable:
+                    continue
+
+                new_path = path + [(nx, ny)]
+                if at_target:
+                    first = new_path[0]
+                    return (first[0] - self.x, first[1] - self.y)
+
+                visited.add((nx, ny))
+                queue.append((nx, ny, new_path))
+
+        return None  # no path found
+
     # --- Hunting ---
     def hunt(self, world):
         if not self.isAlive:
@@ -115,29 +157,32 @@ class Person:
                     if tile.civilization is not None and tile.civilization.symbol == 'A':
                         animal = tile.civilization
 
-                        step_x = 0
-                        step_y = 0
-                        if self.x < target_x: step_x = 1
-                        elif self.x > target_x: step_x = -1
-                        if self.y < target_y: step_y = 1
-                        elif self.y > target_y: step_y = -1
+                        # Kill if already adjacent
+                        if abs(self.x - target_x) <= 1 and abs(self.y - target_y) <= 1:
+                            if self.x != target_x or self.y != target_y:
+                                animal.isAlive = False
+                                world.grid[target_y][target_x].civilization = None
+                                world.animals.remove(animal)
+                                self.add_to_inventory('meat')
+                                self.current_task = 'roaming'
+                                return
 
-                        new_x = self.x + step_x
-                        new_y = self.y + step_y
-
-                        if 0 <= new_x < world.width and 0 <= new_y < world.height:
+                        # BFS toward animal
+                        step = self._find_path_step(world, target_x, target_y)
+                        if step:
+                            ox, oy = step
+                            new_x = self.x + ox
+                            new_y = self.y + oy
                             next_tile = world.grid[new_y][new_x]
-
-                            # kill if stepping on same tile
+                            # Stepping onto the animal's tile kills it
                             if new_x == target_x and new_y == target_y:
                                 animal.isAlive = False
                                 world.grid[target_y][target_x].civilization = None
                                 world.animals.remove(animal)
-                                self.add_to_inventory('meat')  # stored, eaten when hungry
+                                self.add_to_inventory('meat')
                                 self.current_task = 'roaming'
                                 return
-
-                            # move toward animal
+                            # Otherwise move one step closer
                             if next_tile.terrain == 'grass' and next_tile.civilization is None:
                                 world.grid[self.y][self.x].civilization = None
                                 self.x = new_x
@@ -193,49 +238,41 @@ class Person:
                 px = self.farm_x + dx
                 py = self.farm_y + dy
 
-                if 0 <= px < world.width and 0 <= py < world.height:
-                    tile = world.grid[py][px]
-                    if tile.terrain == 'ready':
-                        # on the tile — harvest!
-                        if self.x == px and self.y == py:
-                            tile.terrain = 'grass'
-                            tile.grow_timer = 0
-                            self.add_to_inventory('harvested')
-                            self.add_to_inventory('seed')
-                            self.current_task = 'planting'
-                            return True
+                if not (0 <= px < world.width and 0 <= py < world.height):
+                    continue
 
-                        else:
-                            # try multiple directions to get around obstacles
-                            step_x = 0
-                            step_y = 0
-                            if self.x < px: step_x = 1
-                            elif self.x > px: step_x = -1
-                            if self.y < py: step_y = 1
-                            elif self.y > py: step_y = -1
+                tile = world.grid[py][px]
+                if tile.terrain != 'ready':
+                    continue
 
-                            options = [
-                                (step_x, step_y),
-                                (step_x, 0),
-                                (0, step_y),
-                                (-step_x, step_y),
-                                (step_x, -step_y),
-                            ]
+                # Already standing on it — harvest immediately
+                if self.x == px and self.y == py:
+                    tile.terrain = 'grass'
+                    tile.grow_timer = 0
+                    self.add_to_inventory('harvested')
+                    self.add_to_inventory('seed')
+                    self.current_task = 'planting'
+                    return True
 
-                            for ox, oy in options:
-                                if ox == 0 and oy == 0:
-                                    continue
-                                new_x = self.x + ox
-                                new_y = self.y + oy
-                                if 0 <= new_x < world.width and 0 <= new_y < world.height:
-                                    next_tile = world.grid[new_y][new_x]
-                                    if next_tile.terrain in ('grass', 'farm', 'ready') and next_tile.civilization is None:
-                                        world.grid[self.y][self.x].civilization = None
-                                        self.x = new_x
-                                        self.y = new_y
-                                        world.grid[self.y][self.x].civilization = self
-                                        self.current_task = 'harvesting'
-                                        return True
+                # BFS toward this ready tile
+                step = self._find_path_step(world, px, py)
+                if step is None:
+                    # Completely unreachable (surrounded by water/obstacles) — skip it
+                    continue
+
+                ox, oy = step
+                new_x = self.x + ox
+                new_y = self.y + oy
+                next_tile = world.grid[new_y][new_x]
+
+                if next_tile.terrain in ('grass', 'farm', 'ready') and next_tile.civilization is None:
+                    world.grid[self.y][self.x].civilization = None
+                    self.x = new_x
+                    self.y = new_y
+                    world.grid[self.y][self.x].civilization = self
+                    self.current_task = 'harvesting'
+                    return True
+
         return False
 
     # --- Check ready farms exist ---
@@ -257,7 +294,7 @@ class Person:
             return
 
         self.current_task = 'roaming'
-        directions = [(0,-1),(0,1),(-1,0),(1,0)]
+        directions = [(0, -1), (0, 1), (-1, 0), (1, 0)]
         random.shuffle(directions)
 
         for dx, dy in directions:
