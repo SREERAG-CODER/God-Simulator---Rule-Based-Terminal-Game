@@ -3,30 +3,44 @@ from collections import deque
 
 CHILD_NAMES = [
     "Cain", "Abel", "Seth", "Aya", "Lila", "Ren", "Kael", "Mira",
-    "Theo", "Nora", "Eli", "Zara", "Ivan", "Sena", "Oryn", "Deva"
+    "Theo", "Nora", "Eli", "Zara", "Ivan", "Sena", "Oryn", "Deva",
+    "Luna", "Rex", "Vera", "Otto", "Iris", "Hugo", "Rosa", "Leo"
 ]
+
+# Intelligence thresholds
+INT_BUILD_HUT        = 80
+INT_BUILD_STOREHOUSE = 100
+
+# How often a new build site may be proposed (world ticks between attempts)
+BUILD_COOLDOWN_TICKS = 200
+
 
 class Person:
     def __init__(self, name, x, y, intelligence=10):
-        self.name = name
-        self.x = x
-        self.y = y
-        self.age = 0
-        self.health = 100
-        self.hunger = 100
-        self.intelligence = intelligence
-        self.symbol = 'P'
-        self.isAlive = True
-        self.inventory = []
+        self.name          = name
+        self.x             = x
+        self.y             = y
+        self.age           = 0
+        self.health        = 100
+        self.hunger        = 100
+        self.intelligence  = intelligence
+        self.symbol        = 'P'
+        self.isAlive       = True
+        self.inventory     = []
         self.max_inventory = 25
-        self.has_farm = False
-        self.farm_x = None
-        self.farm_y = None
-        self.farm_full = False
-        self.current_task = 'roaming'
-        self.birth_cooldown = 0       # ticks remaining before can reproduce again
+        self.has_farm      = False
+        self.farm_x        = None
+        self.farm_y        = None
+        self.farm_full     = False
+        self.current_task  = 'roaming'
+        self.birth_cooldown = 0
 
-    # --- Inventory ---
+        # Building state
+        self.build_target  = None   # BuildSite this person is contributing to
+
+    # ════════════════════════════════════════════════════════════
+    # Inventory helpers
+    # ════════════════════════════════════════════════════════════
     def add_to_inventory(self, item):
         if len(self.inventory) < self.max_inventory:
             self.inventory.append(item)
@@ -46,46 +60,42 @@ class Person:
         return self.inventory.count(item_type)
 
     def has_edible_food(self):
-        return (self.has_item('food') or
-                self.has_item('harvested') or
-                self.has_item('meat'))
+        return self.has_item('food') or self.has_item('harvested') or self.has_item('meat')
 
-    # --- Eating ---
+    def total_food_count(self):
+        return (self.inventory_count('food') +
+                self.inventory_count('harvested') +
+                self.inventory_count('meat'))
+
+    # ════════════════════════════════════════════════════════════
+    # Eating
+    # ════════════════════════════════════════════════════════════
     def try_eat(self):
         if self.hunger > 50 and self.health >= 50:
             return
+        for item_type, hunger_gain, health_gain in [
+            ('harvested', 50, 20),
+            ('food',      40, 15),
+            ('meat',      80, 20),
+        ]:
+            if self.has_item(item_type):
+                self.remove_item(item_type)
+                self.hunger = min(100, self.hunger + hunger_gain)
+                self.health = min(100, self.health + health_gain)
+                return
 
-        if self.has_item('harvested'):
-            self.remove_item('harvested')
-            self.hunger = min(100, self.hunger + 50)
-            self.health = min(100, self.health + 20)
-            return
-
-        if self.has_item('food'):
-            self.remove_item('food')
-            self.hunger = min(100, self.hunger + 40)
-            self.health = min(100, self.health + 15)
-            return
-
-        if self.has_item('meat'):
-            self.remove_item('meat')
-            self.hunger = min(100, self.hunger + 80)
-            self.health = min(100, self.health + 20)
-            return
-
-    # --- Hunger & Health ---
+    # ════════════════════════════════════════════════════════════
+    # Hunger / health / aging
+    # ════════════════════════════════════════════════════════════
     def update_hunger(self, tick):
         if tick % 5 == 0:
             self.hunger -= 5
-
         if self.hunger <= 0:
-            self.hunger = 0
+            self.hunger  = 0
             self.health -= 10
-
         if self.health <= 0:
             self.isAlive = False
             return
-
         self.try_eat()
 
     def age_up(self, tick):
@@ -93,27 +103,21 @@ class Person:
             self.age += 1
 
     def intelligence_gain(self, tick):
-        if self.intelligence < 200:
-            if tick % 30 == 0:
-                self.intelligence += 5
+        if self.intelligence < 200 and tick % 30 == 0:
+            self.intelligence += 5
 
     def tick_cooldowns(self):
         if self.birth_cooldown > 0:
             self.birth_cooldown -= 1
 
-    # --- BFS Pathfinder ---
+    # ════════════════════════════════════════════════════════════
+    # BFS pathfinder
+    # ════════════════════════════════════════════════════════════
     def _find_path_step(self, world, target_x, target_y):
-        """
-        BFS from current position to (target_x, target_y).
-        Returns the (dx, dy) of the first step along the shortest
-        walkable path, or None if no path exists.
-        Water is never passable. The target tile itself is allowed
-        even if currently occupied.
-        """
         if self.x == target_x and self.y == target_y:
             return None
 
-        queue = deque()
+        queue   = deque()
         queue.append((self.x, self.y, []))
         visited = {(self.x, self.y)}
 
@@ -125,31 +129,325 @@ class Person:
                     continue
                 if (nx, ny) in visited:
                     continue
-
-                tile = world.grid[ny][nx]
+                tile      = world.grid[ny][nx]
                 at_target = (nx == target_x and ny == target_y)
-                passable = (
+                passable  = (
                     tile.terrain != 'water' and
                     (tile.civilization is None or at_target)
                 )
                 if not passable:
                     continue
-
                 new_path = path + [(nx, ny)]
                 if at_target:
                     first = new_path[0]
                     return (first[0] - self.x, first[1] - self.y)
-
                 visited.add((nx, ny))
                 queue.append((nx, ny, new_path))
-
         return None
 
-    # --- Hunting ---
+    # ════════════════════════════════════════════════════════════
+    # Resource gathering  (wood / stone / fiber)
+    # ════════════════════════════════════════════════════════════
+    def _gather_resource(self, world, terrain_type, item_name, spent_terrain, radius=12):
+        """
+        BFS-walk toward the nearest tile of `terrain_type` within `radius`.
+        On arrival, collect the resource and mark tile as `spent_terrain`.
+        Returns True if gathered or moved toward one.
+        """
+        best_dist = radius + 1
+        best_pos  = None
+
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                tx, ty = self.x + dx, self.y + dy
+                if not (0 <= tx < world.width and 0 <= ty < world.height):
+                    continue
+                if world.grid[ty][tx].terrain == terrain_type:
+                    d = abs(dx) + abs(dy)
+                    if d < best_dist:
+                        best_dist = d
+                        best_pos  = (tx, ty)
+
+        if best_pos is None:
+            return False
+
+        tx, ty = best_pos
+
+        # Adjacent — collect
+        if abs(self.x - tx) <= 1 and abs(self.y - ty) <= 1 and (self.x != tx or self.y != ty):
+            world.grid[ty][tx].terrain = spent_terrain
+            self.add_to_inventory(item_name)
+            return True
+
+        # Move toward
+        step = self._find_path_step(world, tx, ty)
+        if step:
+            ox, oy  = step
+            new_x   = self.x + ox
+            new_y   = self.y + oy
+            next_t  = world.grid[new_y][new_x]
+            if next_t.terrain not in ('water',) and next_t.civilization is None:
+                world.grid[self.y][self.x].civilization = None
+                self.x, self.y = new_x, new_y
+                world.grid[self.y][self.x].civilization = self
+                return True
+        return False
+
+    def gather_wood(self, world):
+        self.current_task = 'gathering_wood'
+        return self._gather_resource(world, 'forest', 'wood', 'stump')
+
+    def gather_stone(self, world):
+        self.current_task = 'gathering_stone'
+        return self._gather_resource(world, 'rock', 'stone', 'rubble')
+
+    def gather_fiber(self, world):
+        self.current_task = 'gathering_fiber'
+        return self._gather_resource(world, 'fiber', 'fiber', 'fiber_spent')
+
+    # ════════════════════════════════════════════════════════════
+    # Building logic
+    # ════════════════════════════════════════════════════════════
+    def _has_materials_for(self, recipe):
+        """Check if this person carries at least some of what's still needed."""
+        for resource, amount in recipe.items():
+            if amount > 0 and self.has_item(resource):
+                return True
+        return False
+
+    def _gather_for_recipe(self, world, recipe):
+        """
+        Try to gather whichever resource in recipe we still lack.
+        Returns True if action taken.
+        """
+        if recipe.get('wood', 0) > 0 and not self.has_item('wood'):
+            return self.gather_wood(world)
+        if recipe.get('stone', 0) > 0 and not self.has_item('stone'):
+            return self.gather_stone(world)
+        if recipe.get('fiber', 0) > 0 and not self.has_item('fiber'):
+            return self.gather_fiber(world)
+        return False
+
+    def propose_build_site(self, world, kind):
+        """
+        Find a free grass tile not too close to existing buildings and
+        register a new BuildSite. Returns the site or None.
+        """
+        from Building import BuildSite
+        MIN_DIST = 8   # minimum tiles away from existing buildings
+
+        for _ in range(200):
+            x = random.randint(1, world.width - 2)
+            y = random.randint(1, world.height - 2)
+            tile = world.grid[y][x]
+            if tile.terrain != 'grass' or tile.civilization is not None:
+                continue
+            # Check not too close to existing huts/storehouses
+            too_close = False
+            for blist in (world.huts, world.storehouses, world.build_sites):
+                for b in blist:
+                    if abs(b.x - x) + abs(b.y - y) < MIN_DIST:
+                        too_close = True
+                        break
+                if too_close:
+                    break
+            if not too_close:
+                return world.add_build_site(kind, x, y)
+        return None
+
+    def try_contribute_to_build(self, world):
+        """
+        Main building action called each tick.
+        Priority:
+          1. If a build site exists that needs what we carry → go contribute.
+          2. If we are assigned a site, gather materials for it.
+          3. If intelligence allows and no site exists, propose one.
+        Returns True if action taken (moved or contributed).
+        """
+        from Building import BuildSite
+
+        # ── Determine what we can build ──────────────────────────────────────
+        can_hut        = self.intelligence >= INT_BUILD_HUT
+        can_storehouse = (self.intelligence >= INT_BUILD_STOREHOUSE and
+                          len(world.huts) > 0)
+
+        if not can_hut:
+            return False
+
+        # ── Find nearest site we can contribute to ───────────────────────────
+        target_site = None
+        target_dist = 9999
+
+        for site in world.build_sites:
+            # Only help sites matching our capability
+            if site.kind == 'storehouse' and not can_storehouse:
+                continue
+            d = abs(site.x - self.x) + abs(site.y - self.y)
+            if d < target_dist:
+                # Does the site still need something we carry or can gather?
+                target_dist = d
+                target_site = site
+
+        # ── Propose a new site if none exists ────────────────────────────────
+        if target_site is None:
+            # Avoid spamming: only propose if no site of that kind exists
+            if can_storehouse and not any(s.kind == 'storehouse' for s in world.build_sites):
+                # Check if we need a new storehouse (1 per 8 people heuristic)
+                if len(world.storehouses) < max(1, len(world.people) // 8):
+                    target_site = self.propose_build_site(world, 'storehouse')
+            if target_site is None and can_hut:
+                # 1 hut per 5 people heuristic
+                if len(world.huts) < max(1, len(world.people) // 5):
+                    if not any(s.kind == 'hut' for s in world.build_sites):
+                        target_site = self.propose_build_site(world, 'hut')
+
+        if target_site is None:
+            return False
+
+        self.build_target = target_site
+        recipe_needed     = target_site.needed
+
+        # ── If adjacent to site and carry materials → contribute ─────────────
+        dist = abs(self.x - target_site.x) + abs(self.y - target_site.y)
+        if dist <= 1 and self._has_materials_for(recipe_needed):
+            self.current_task = 'building'
+            contributed = target_site.contribute(self)
+            if target_site.is_complete():
+                world.complete_build_site(target_site)
+                self.build_target = None
+            return contributed
+
+        # ── Need to gather materials first ───────────────────────────────────
+        still_needed = {k: v for k, v in recipe_needed.items() if v > 0}
+        if self._has_materials_for(still_needed):
+            # Walk to the build site
+            self.current_task = 'building'
+            step = self._find_path_step(world, target_site.x, target_site.y)
+            if step:
+                ox, oy = step
+                nx, ny = self.x + ox, self.y + oy
+                tile   = world.grid[ny][nx]
+                if tile.terrain != 'water' and tile.civilization is None:
+                    world.grid[self.y][self.x].civilization = None
+                    self.x, self.y = nx, ny
+                    world.grid[self.y][self.x].civilization = self
+                    return True
+        else:
+            # Gather what's missing
+            return self._gather_for_recipe(world, still_needed)
+
+        return False
+
+    # ════════════════════════════════════════════════════════════
+    # Hut healing — seek hut when hurt
+    # ════════════════════════════════════════════════════════════
+    def try_seek_hut(self, world):
+        """
+        If health below 60 and a hut exists, BFS-walk toward the nearest hut.
+        Healing is passive (applied by world.apply_hut_healing each tick).
+        Returns True if moved toward hut.
+        """
+        if self.health >= 60 or not world.huts:
+            return False
+
+        hut = world.nearest_hut(self.x, self.y)
+        if hut is None:
+            return False
+
+        dist = abs(self.x - hut.x) + abs(self.y - hut.y)
+        if dist <= Hut_HEAL_RADIUS(hut):
+            self.current_task = 'healing'
+            return True   # already in range, just stay
+
+        self.current_task = 'seeking_hut'
+        step = self._find_path_step(world, hut.x, hut.y)
+        if step:
+            ox, oy = step
+            nx, ny = self.x + ox, self.y + oy
+            tile   = world.grid[ny][nx]
+            if tile.terrain != 'water' and tile.civilization is None:
+                world.grid[self.y][self.x].civilization = None
+                self.x, self.y = nx, ny
+                world.grid[self.y][self.x].civilization = self
+                return True
+        return False
+
+    # ════════════════════════════════════════════════════════════
+    # Storehouse interactions
+    # ════════════════════════════════════════════════════════════
+    def try_deposit_to_storehouse(self, world):
+        """
+        If carrying > 10 food items, walk to nearest storehouse and deposit.
+        Returns True if action taken.
+        """
+        if not world.storehouses:
+            return False
+        if self.total_food_count() <= 10:
+            return False
+
+        sh   = world.nearest_storehouse(self.x, self.y)
+        if sh is None:
+            return False
+
+        dist = abs(self.x - sh.x) + abs(self.y - sh.y)
+        if dist <= Storehouse_INTERACT_RADIUS(sh):
+            deposited = sh.deposit(self)
+            if deposited:
+                self.current_task = 'depositing'
+            return deposited > 0
+
+        self.current_task = 'depositing'
+        step = self._find_path_step(world, sh.x, sh.y)
+        if step:
+            ox, oy = step
+            nx, ny = self.x + ox, self.y + oy
+            tile   = world.grid[ny][nx]
+            if tile.terrain != 'water' and tile.civilization is None:
+                world.grid[self.y][self.x].civilization = None
+                self.x, self.y = nx, ny
+                world.grid[self.y][self.x].civilization = self
+                return True
+        return False
+
+    def try_withdraw_from_storehouse(self, world):
+        """
+        If hungry and no food in inventory, try to withdraw from nearest storehouse.
+        Returns True if withdrew food.
+        """
+        if not world.storehouses:
+            return False
+        if self.hunger > 30 or self.has_edible_food():
+            return False
+
+        sh = world.nearest_storehouse(self.x, self.y)
+        if sh is None or sh.is_empty():
+            return False
+
+        dist = abs(self.x - sh.x) + abs(self.y - sh.y)
+        if dist <= Storehouse_INTERACT_RADIUS(sh):
+            withdrawn = sh.withdraw(self)
+            if withdrawn:
+                self.current_task = 'withdrawing'
+            return withdrawn > 0
+
+        self.current_task = 'withdrawing'
+        step = self._find_path_step(world, sh.x, sh.y)
+        if step:
+            ox, oy = step
+            nx, ny = self.x + ox, self.y + oy
+            tile   = world.grid[ny][nx]
+            if tile.terrain != 'water' and tile.civilization is None:
+                world.grid[self.y][self.x].civilization = None
+                self.x, self.y = nx, ny
+                world.grid[self.y][self.x].civilization = self
+                return True
+        return False
+
+    # ════════════════════════════════════════════════════════════
+    # Hunting
+    # ════════════════════════════════════════════════════════════
     def hunt(self, world):
-        if not self.isAlive:
-            return
-        if self.intelligence < 30:
+        if not self.isAlive or self.intelligence < 30:
             return
 
         self.current_task = 'hunting'
@@ -157,47 +455,44 @@ class Person:
 
         for dy in range(-radius, radius + 1):
             for dx in range(-radius, radius + 1):
-                target_x = self.x + dx
-                target_y = self.y + dy
+                tx = self.x + dx
+                ty = self.y + dy
+                if not (0 <= tx < world.width and 0 <= ty < world.height):
+                    continue
+                tile = world.grid[ty][tx]
+                if tile.civilization is None or tile.civilization.symbol != 'A':
+                    continue
+                animal = tile.civilization
 
-                if 0 <= target_x < world.width and 0 <= target_y < world.height:
-                    tile = world.grid[target_y][target_x]
+                if abs(self.x - tx) <= 1 and abs(self.y - ty) <= 1 and (self.x != tx or self.y != ty):
+                    animal.isAlive = False
+                    world.grid[ty][tx].civilization = None
+                    world.animals.remove(animal)
+                    self.add_to_inventory('meat')
+                    self.current_task = 'roaming'
+                    return
 
-                    if tile.civilization is not None and tile.civilization.symbol == 'A':
-                        animal = tile.civilization
+                step = self._find_path_step(world, tx, ty)
+                if step:
+                    ox, oy = step
+                    nx, ny = self.x + ox, self.y + oy
+                    if nx == tx and ny == ty:
+                        animal.isAlive = False
+                        world.grid[ty][tx].civilization = None
+                        world.animals.remove(animal)
+                        self.add_to_inventory('meat')
+                        self.current_task = 'roaming'
+                        return
+                    next_t = world.grid[ny][nx]
+                    if next_t.terrain == 'grass' and next_t.civilization is None:
+                        world.grid[self.y][self.x].civilization = None
+                        self.x, self.y = nx, ny
+                        world.grid[self.y][self.x].civilization = self
+                        return
 
-                        # Kill if already adjacent
-                        if abs(self.x - target_x) <= 1 and abs(self.y - target_y) <= 1:
-                            if self.x != target_x or self.y != target_y:
-                                animal.isAlive = False
-                                world.grid[target_y][target_x].civilization = None
-                                world.animals.remove(animal)
-                                self.add_to_inventory('meat')
-                                self.current_task = 'roaming'
-                                return
-
-                        # BFS toward animal
-                        step = self._find_path_step(world, target_x, target_y)
-                        if step:
-                            ox, oy = step
-                            new_x = self.x + ox
-                            new_y = self.y + oy
-                            next_tile = world.grid[new_y][new_x]
-                            if new_x == target_x and new_y == target_y:
-                                animal.isAlive = False
-                                world.grid[target_y][target_x].civilization = None
-                                world.animals.remove(animal)
-                                self.add_to_inventory('meat')
-                                self.current_task = 'roaming'
-                                return
-                            if next_tile.terrain == 'grass' and next_tile.civilization is None:
-                                world.grid[self.y][self.x].civilization = None
-                                self.x = new_x
-                                self.y = new_y
-                                world.grid[self.y][self.x].civilization = self
-                                return
-
-    # --- Seed Collection ---
+    # ════════════════════════════════════════════════════════════
+    # Seed / farming
+    # ════════════════════════════════════════════════════════════
     def try_collect_seed(self, world):
         if self.farm_full:
             return
@@ -206,112 +501,79 @@ class Person:
             if self.add_to_inventory('seed'):
                 tile.terrain = 'grass'
 
-    # --- Planting ---
     def try_plant(self, world):
-        if not self.has_item('seed'):
+        if not self.has_item('seed') or self.intelligence < 40:
             return
-        if self.intelligence < 40:
-            return
-
         if not self.has_farm:
             self.has_farm = True
-            self.farm_x = self.x
-            self.farm_y = self.y
-
+            self.farm_x   = self.x
+            self.farm_y   = self.y
         for dy in range(-5, 6):
             for dx in range(-5, 6):
-                px = self.farm_x + dx
-                py = self.farm_y + dy
-
+                px, py = self.farm_x + dx, self.farm_y + dy
                 if 0 <= px < world.width and 0 <= py < world.height:
                     if (dx**2 + dy**2) <= 25:
                         tile = world.grid[py][px]
                         if tile.terrain == 'grass' and tile.civilization is None:
-                            tile.terrain = 'farm'
+                            tile.terrain    = 'farm'
                             tile.grow_timer = 0
                             self.remove_item('seed')
                             self.current_task = 'farming'
                             return
-
         self.farm_full = True
 
-    # --- Harvesting ---
     def try_harvest(self, world):
         if not self.has_farm:
             return False
-
         for dy in range(-5, 6):
             for dx in range(-5, 6):
-                px = self.farm_x + dx
-                py = self.farm_y + dy
-
+                px, py = self.farm_x + dx, self.farm_y + dy
                 if not (0 <= px < world.width and 0 <= py < world.height):
                     continue
-
                 tile = world.grid[py][px]
                 if tile.terrain != 'ready':
                     continue
-
                 if self.x == px and self.y == py:
-                    tile.terrain = 'grass'
+                    tile.terrain    = 'grass'
                     tile.grow_timer = 0
                     self.add_to_inventory('harvested')
                     self.add_to_inventory('seed')
                     self.current_task = 'planting'
-                    self.farm_full = False   # freed tile — can plant again
+                    self.farm_full    = False
                     return True
-
                 step = self._find_path_step(world, px, py)
                 if step is None:
                     continue
-
-                ox, oy = step
-                new_x = self.x + ox
-                new_y = self.y + oy
-                next_tile = world.grid[new_y][new_x]
-
-                if next_tile.terrain in ('grass', 'farm', 'ready') and next_tile.civilization is None:
+                ox, oy  = step
+                nx, ny  = self.x + ox, self.y + oy
+                next_t  = world.grid[ny][nx]
+                if next_t.terrain in ('grass', 'farm', 'ready') and next_t.civilization is None:
                     world.grid[self.y][self.x].civilization = None
-                    self.x = new_x
-                    self.y = new_y
+                    self.x, self.y = nx, ny
                     world.grid[self.y][self.x].civilization = self
                     self.current_task = 'harvesting'
                     return True
-
         return False
 
-    # --- Food Sharing ---
+    # ════════════════════════════════════════════════════════════
+    # Food sharing
+    # ════════════════════════════════════════════════════════════
     def try_share_food(self, world):
-        """
-        If this person is well-fed (hunger > 70) and has surplus edible food,
-        give one item to any adjacent starving person (hunger < 30).
-        Priority: most starving neighbour first.
-        """
         if self.hunger <= 50:
             return
-        # Collect edible items we can spare (never share seeds)
         shareable = [i for i in ('harvested', 'food', 'meat') if self.has_item(i)]
         if not shareable:
             return
-
-        # Find adjacent starving people, sorted by hunger ascending (hungriest first)
         neighbours = []
         for other in world.people:
-            if other is self or not other.isAlive:
+            if other is self or not other.isAlive or other.hunger >= 30:
                 continue
-            if other.hunger >= 30:
-                continue
-            dist = abs(self.x - other.x) + abs(self.y - other.y)
-            if dist <= 1:
+            if abs(self.x - other.x) + abs(self.y - other.y) <= 1:
                 neighbours.append(other)
-
         if not neighbours:
             return
-
         neighbours.sort(key=lambda p: p.hunger)
         recipient = neighbours[0]
-
-        # Hand over the best available item
         for item in ('harvested', 'meat', 'food'):
             if self.has_item(item):
                 self.remove_item(item)
@@ -319,178 +581,113 @@ class Person:
                 self.current_task = 'sharing'
                 return
 
-    # --- Seek Partner ---
+    # ════════════════════════════════════════════════════════════
+    # Reproduction
+    # ════════════════════════════════════════════════════════════
     def seek_partner(self, world):
-        """
-        When this person is reproduction-ready but no partner is close enough,
-        actively BFS-walk one step toward the nearest eligible partner.
-        Returns True if a step was taken.
-        """
-        if self.birth_cooldown > 0:
-            return False
-        if self.health < 70 or self.hunger < 40 or self.intelligence < 50:
-            return False
-        if self.age < 15:
-            return False
-        if len(world.people) >= world.population_cap:
-            return False
+        if self.birth_cooldown > 0: return False
+        if self.health < 70 or self.hunger < 40 or self.intelligence < 50: return False
+        if self.age < 15: return False
+        if len(world.people) >= world.population_cap: return False
 
-        # Find nearest eligible partner
-        best = None
-        best_dist = float('inf')
+        best, best_dist = None, float('inf')
         for other in world.people:
-            if other is self or not other.isAlive:
-                continue
-            if other.birth_cooldown > 0:
-                continue
-            if other.health < 70 or other.hunger < 40 or other.intelligence < 50:
-                continue
-            if other.age < 15:
-                continue
+            if other is self or not other.isAlive: continue
+            if other.birth_cooldown > 0: continue
+            if other.health < 70 or other.hunger < 40 or other.intelligence < 50: continue
+            if other.age < 15: continue
             dist = abs(self.x - other.x) + abs(self.y - other.y)
-            if dist <= 2:
-                return False  # already close enough — let try_reproduce handle it
+            if dist <= 2: return False
             if dist < best_dist:
                 best_dist = dist
-                best = other
+                best      = other
 
-        if best is None:
-            return False
-
+        if best is None: return False
         step = self._find_path_step(world, best.x, best.y)
-        if step is None:
-            return False
-
+        if step is None: return False
         ox, oy = step
-        new_x, new_y = self.x + ox, self.y + oy
-        tile = world.grid[new_y][new_x]
+        nx, ny = self.x + ox, self.y + oy
+        tile   = world.grid[ny][nx]
         if tile.terrain in ('grass', 'food', 'seed') and tile.civilization is None:
             if tile.terrain == 'food':
                 self.add_to_inventory('food')
                 tile.terrain = 'grass'
             world.grid[self.y][self.x].civilization = None
-            self.x, self.y = new_x, new_y
+            self.x, self.y = nx, ny
             world.grid[self.y][self.x].civilization = self
             self.current_task = 'seeking'
             return True
-
         return False
 
-    # --- Reproduction ---
     def try_reproduce(self, world):
-        """
-        Scan nearby people for a healthy, ready partner.
-        Conditions (both parents must meet):
-          - health >= 70, hunger >= 60, intelligence >= 50
-          - birth_cooldown == 0
-          - within Manhattan distance 2
-        On success: spawns a child adjacent to self, applies 150-tick
-        cooldown to both parents, returns the new Person.
-        Returns None if no birth occurred.
-        """
-        if not self.isAlive:
-            return None
-        if self.birth_cooldown > 0:
-            return None
-        if self.health < 70 or self.hunger < 40:
-            return None
-        if self.intelligence < 50:
-            return None
-        if self.age < 15:
-            return None
-        if len(world.people) >= world.population_cap:
-            return None
+        if not self.isAlive or self.birth_cooldown > 0: return None
+        if self.health < 70 or self.hunger < 40: return None
+        if self.intelligence < 50 or self.age < 15: return None
+        if len(world.people) >= world.population_cap: return None
 
         for other in world.people:
-            if other is self:
-                continue
-            if not other.isAlive:
-                continue
-            if other.birth_cooldown > 0:
-                continue
-            if other.health < 70 or other.hunger < 40:
-                continue
-            if other.intelligence < 50:
-                continue
-            if other.age < 15:
-                continue
+            if other is self or not other.isAlive: continue
+            if other.birth_cooldown > 0: continue
+            if other.health < 70 or other.hunger < 40: continue
+            if other.intelligence < 50 or other.age < 15: continue
+            if abs(self.x - other.x) + abs(self.y - other.y) > 2: continue
 
-            dist = abs(self.x - other.x) + abs(self.y - other.y)
-            if dist > 2:
-                continue
-
-            # Find a free adjacent grass tile for the child
             child_pos = None
-            for dx, dy in random.sample([(0, -1), (0, 1), (-1, 0), (1, 0)], 4):
+            for dx, dy in random.sample([(0,-1),(0,1),(-1,0),(1,0)], 4):
                 cx, cy = self.x + dx, self.y + dy
                 if 0 <= cx < world.width and 0 <= cy < world.height:
-                    tile = world.grid[cy][cx]
-                    if tile.terrain == 'grass' and tile.civilization is None:
+                    t = world.grid[cy][cx]
+                    if t.terrain == 'grass' and t.civilization is None:
                         child_pos = (cx, cy)
                         break
-
             if child_pos is None:
-                continue  # no room near this parent — try next candidate
+                continue
 
-            # Name: pick unused name from pool
-            used_names = {p.name for p in world.people}
-            available = [n for n in CHILD_NAMES if n not in used_names]
-            child_name = available[0] if available else f"Child{len(world.people)}"
-
-            # Intelligence: average of parents ± small variance
+            used_names  = {p.name for p in world.people}
+            available   = [n for n in CHILD_NAMES if n not in used_names]
+            child_name  = available[0] if available else f"Child{len(world.people)}"
             child_intel = int((self.intelligence + other.intelligence) / 2)
             child_intel = max(10, min(200, child_intel + random.randint(-10, 10)))
 
-            # Cooldown both parents
-            self.birth_cooldown = 150
+            self.birth_cooldown  = 150
             other.birth_cooldown = 150
 
-            # Place child
             cx, cy = child_pos
-            child = Person(child_name, cx, cy, intelligence=child_intel)
+            child  = Person(child_name, cx, cy, intelligence=child_intel)
             world.grid[cy][cx].civilization = child
             world.people.append(child)
-
             return child
-
         return None
 
-    # --- Check ready farms exist ---
-    def has_ready_farm(self, world):
-        if not self.has_farm:
-            return False
-        for dy in range(-5, 6):
-            for dx in range(-5, 6):
-                px = self.farm_x + dx
-                py = self.farm_y + dy
-                if 0 <= px < world.width and 0 <= py < world.height:
-                    if world.grid[py][px].terrain == 'ready':
-                        return True
-        return False
-
-    # --- Movement ---
+    # ════════════════════════════════════════════════════════════
+    # Movement (fallback)
+    # ════════════════════════════════════════════════════════════
     def move(self, world, tick):
         if not self.isAlive:
-            return
-
+            return False
         self.current_task = 'roaming'
-        directions = [(0, -1), (0, 1), (-1, 0), (1, 0)]
+        directions = [(0,-1),(0,1),(-1,0),(1,0)]
         random.shuffle(directions)
-
         for dx, dy in directions:
-            new_x = self.x + dx
-            new_y = self.y + dy
-
-            if 0 <= new_x < world.width and 0 <= new_y < world.height:
-                tile = world.grid[new_y][new_x]
-                if tile.terrain in ('grass', 'food', 'seed') and tile.civilization is None:
-
+            nx, ny = self.x + dx, self.y + dy
+            if 0 <= nx < world.width and 0 <= ny < world.height:
+                tile = world.grid[ny][nx]
+                if tile.terrain in ('grass','food','seed') and tile.civilization is None:
                     if tile.terrain == 'food':
                         self.add_to_inventory('food')
                         tile.terrain = 'grass'
-
                     world.grid[self.y][self.x].civilization = None
-                    self.x = new_x
-                    self.y = new_y
+                    self.x, self.y = nx, ny
                     world.grid[self.y][self.x].civilization = self
-                    break
+                    return True
+        return False
+
+
+# ── Module-level helpers (avoid circular import) ─────────────────────────────
+def Hut_HEAL_RADIUS(hut):
+    from Building import Hut
+    return Hut.HEAL_RADIUS
+
+def Storehouse_INTERACT_RADIUS(sh):
+    from Building import Storehouse
+    return Storehouse.INTERACT_RADIUS
