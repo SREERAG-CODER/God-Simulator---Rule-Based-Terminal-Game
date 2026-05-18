@@ -10,8 +10,8 @@ class Tile:
         if self.terrain == 'farm':    return 'F'
         if self.terrain == 'ready':   return 'R'
         if self.terrain == 'forest':  return 'T'
-        if self.terrain == 'rock':    return 'o'
-        if self.terrain == 'fiber':   return 'i'
-        if self.terrain == 'stump':   return 't'   # recently chopped
-        if self.terrain == 'rubble':  return 'r'   # recently mined
         return '.'   # grass, food, seed hidden
+    
+
+
+    # To add : logic on when to cut trees and mine rocks
