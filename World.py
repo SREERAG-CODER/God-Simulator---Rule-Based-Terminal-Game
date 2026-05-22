@@ -5,11 +5,9 @@ from Animal import Animal
 from Building import BuildSite, Hut, Storehouse
 
 # ── Population cap constants ──────────────────────────────────────────────────
-BASE_POP_CAP          = 10    # starting cap before any buildings
-POP_CAP_PER_HUT       = 5    # each completed hut adds this
-# Storehouse food scaling: for every FOOD_PER_POP food stored across all
-# storehouses, the cap rises by 1 (up to STOREHOUSE_POP_CAP_MAX bonus)
-FOOD_PER_POP          = 8
+BASE_POP_CAP           = 10
+POP_CAP_PER_HUT        = 5
+FOOD_PER_POP           = 8
 STOREHOUSE_POP_CAP_MAX = 30
 
 
@@ -21,39 +19,37 @@ class World:
         self.people         = []
         self.animals        = []
 
-        # Base cap is stored separately so we can recompute dynamically
         self._base_pop_cap  = population_cap
-        self._hut_pop_bonus = 0          # cumulative bonus from completed huts
-        self.population_cap = population_cap   # recomputed each tick
+        self._hut_pop_bonus = 0
+        self.population_cap = population_cap
 
         # Buildings
-        self.huts           = []        # list of Hut
-        self.storehouses    = []        # list of Storehouse
-        self.build_sites    = []        # list of BuildSite (in-progress)
+        self.huts           = []
+        self.storehouses    = []
+        self.build_sites    = []
+
+        # ── King / governance ─────────────────────────────────────────────
+        self.king              = None    # King instance or None
+        self.council           = []      # list of Person during interregnum
+        self.starvation_count  = 0       # cumulative starving-ticks this reign
+        self.succession_log    = []      # (tick, name, reason) tuples
+        self._king_check_done  = False   # first-tick crown flag
 
         self.generate_terrain()
         self.spawn_animals()
 
     # ── Population cap ───────────────────────────────────────────────────────
     def recompute_population_cap(self):
-        """
-        Call once per tick.  Cap = base + hut bonus + storehouse food bonus.
-        Storehouse bonus: floor(total_stored_food / FOOD_PER_POP), capped at
-        STOREHOUSE_POP_CAP_MAX.  This means keeping storehouses well-stocked
-        meaningfully raises how many people the world can sustain.
-        """
         total_food = sum(sh.food_count() for sh in self.storehouses)
         food_bonus = min(STOREHOUSE_POP_CAP_MAX, total_food // FOOD_PER_POP)
         self.population_cap = self._base_pop_cap + self._hut_pop_bonus + food_bonus
 
     def storehouse_food_bonus(self):
-        """Return current food-driven population bonus (for display)."""
         total_food = sum(sh.food_count() for sh in self.storehouses)
         return min(STOREHOUSE_POP_CAP_MAX, total_food // FOOD_PER_POP)
 
     # ── Terrain generation ───────────────────────────────────────────────────
     def generate_terrain(self):
-        # Water blobs
         for _ in range(4):
             cx     = random.randint(3, self.width - 4)
             cy     = random.randint(3, self.height - 4)
@@ -63,7 +59,6 @@ class World:
                     if (x - cx) ** 2 + (y - cy) ** 2 <= radius ** 2:
                         self.grid[y][x].terrain = 'water'
 
-        # Forest clusters (wood source)
         for _ in range(6):
             cx     = random.randint(3, self.width - 4)
             cy     = random.randint(3, self.height - 4)
@@ -74,7 +69,6 @@ class World:
                         if self.grid[y][x].terrain == 'grass':
                             self.grid[y][x].terrain = 'forest'
 
-        # Rock clusters (stone source)
         for _ in range(4):
             cx     = random.randint(3, self.width - 4)
             cy     = random.randint(3, self.height - 4)
@@ -85,7 +79,6 @@ class World:
                         if self.grid[y][x].terrain == 'grass':
                             self.grid[y][x].terrain = 'rock'
 
-        # Fiber patches
         fiber_count = 0
         while fiber_count < 60:
             x = random.randint(0, self.width - 1)
@@ -94,7 +87,6 @@ class World:
                 self.grid[y][x].terrain = 'fiber'
                 fiber_count += 1
 
-        # Hidden food
         food_count = 0
         while food_count < 100:
             x = random.randint(0, self.width - 1)
@@ -103,7 +95,6 @@ class World:
                 self.grid[y][x].terrain = 'food'
                 food_count += 1
 
-        # Hidden seeds
         seed_count = 0
         while seed_count < 60:
             x = random.randint(0, self.width - 1)
@@ -162,14 +153,12 @@ class World:
         return site
 
     def complete_build_site(self, site):
-        """Convert a finished BuildSite into the real building."""
         x, y = site.x, site.y
         self.build_sites.remove(site)
 
         if site.kind == 'hut':
             building = Hut(x, y)
             self.huts.append(building)
-            # Accumulate hut bonus separately; recompute_population_cap will apply it
             self._hut_pop_bonus += Hut.POP_BONUS
             self.grid[y][x].civilization = building
         elif site.kind == 'storehouse':
@@ -177,7 +166,6 @@ class World:
             self.storehouses.append(building)
             self.grid[y][x].civilization = building
 
-        # Immediately recompute so the cap is current
         self.recompute_population_cap()
 
     def apply_hut_healing(self):
@@ -277,6 +265,87 @@ class World:
                 if self.grid[p.y][p.x].civilization is p:
                     self.grid[p.y][p.x].civilization = None
         self.people = alive
+
+    # ── King / governance ────────────────────────────────────────────────────
+    def appoint_king(self, tick_num):
+        """
+        Crown the living person with the highest intelligence.
+        Called once when population first reaches 2+.
+        """
+        from King import King
+        candidates = [p for p in self.people if p.isAlive]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda p: p.intelligence, reverse=True)
+        chosen     = candidates[0]
+        self.king  = King(chosen, tick_num)
+        self.succession_log.append((tick_num, chosen.name, 'crowned'))
+        return self.king
+
+    def update_king(self, tick_num):
+        """
+        Called every tick.  Handles:
+          • First-time coronation
+          • King death / overthrow → form council → elect successor
+          • Loyalty drift
+          • King's own governance tick
+        """
+        from King import King, update_loyalties, form_council, elect_new_king
+
+        # ── First coronation ──────────────────────────────────────────────
+        if self.king is None and not self._king_check_done:
+            alive = [p for p in self.people if p.isAlive]
+            if len(alive) >= 2:
+                self.appoint_king(tick_num)
+                self._king_check_done = True
+            return
+
+        if self.king is None:
+            # Interregnum: council already formed, waiting to elect
+            if self.council:
+                # Remove dead council members
+                self.council = [p for p in self.council if p.isAlive]
+                if self.council:
+                    elect_new_king(self, tick_num)
+                else:
+                    # Everyone on council is dead — pick from survivors
+                    form_council(self)
+                    if self.council:
+                        elect_new_king(self, tick_num)
+            else:
+                # No council yet — form one if enough survivors
+                alive = [p for p in self.people if p.isAlive]
+                if len(alive) >= 1:
+                    form_council(self)
+            return
+
+        # ── Check if king is still alive ──────────────────────────────────
+        if not self.king.person.isAlive:
+            self.succession_log.append((tick_num, self.king.person.name, 'died'))
+            self.king = None
+            form_council(self)
+            if self.council:
+                elect_new_king(self, tick_num)
+            return
+
+        # ── Check for overthrow ───────────────────────────────────────────
+        if self.king.check_overthrow(self):
+            self.succession_log.append((tick_num, self.king.person.name, 'overthrown'))
+            # Make outcast
+            old         = self.king.person
+            old.symbol  = 'O'          # 'O' for outcast
+            old.is_king = False
+            old.is_outcast = True
+            self.king   = None
+            self.starvation_count = 0
+            form_council(self)
+            if self.council:
+                elect_new_king(self, tick_num)
+            return
+
+        # ── Normal reign tick ─────────────────────────────────────────────
+        update_loyalties(self)
+        self.king.tick(self, tick_num)
 
     # ── Display ──────────────────────────────────────────────────────────────
     def display(self):

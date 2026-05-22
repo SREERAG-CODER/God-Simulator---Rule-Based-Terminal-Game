@@ -2,11 +2,17 @@ import time
 import os
 import random
 from World import World
+from King import TAX_INTERVAL
 
 def draw_bar(label, value, max_value=100, length=15):
     filled = int((value / max_value) * length)
     bar = '█' * filled + '░' * (length - filled)
     return f"{label}:[{bar}]{value:>3}"
+
+def draw_loyalty_bar(value, length=10):
+    filled = int((value / 100) * length)
+    bar = '█' * filled + '░' * (length - filled)
+    return f"[{bar}]{value:>3}"
 
 # ── Stat tracking ─────────────────────────────────────────────────────────────
 class Stats:
@@ -92,7 +98,10 @@ while any(p.isAlive for p in world.people):
             stats.record_inventory_gains(person, old_inv)
             stats.snapshot(person)
 
-    # ── Detect births ─────────────────────────────────────────────────────────
+    # ── King governance update ────────────────────────────────────────────
+    world.update_king(tick)
+
+    # ── Detect births ─────────────────────────────────────────────────────
     for p in world.people:
         if id(p) not in prev_people:
             parents = [x.name for x in world.people if x is not p and x.birth_cooldown > 140]
@@ -107,7 +116,7 @@ while any(p.isAlive for p in world.people):
             if s:
                 s['born_tick'] = tick
 
-    # ── Detect deaths ─────────────────────────────────────────────────────────
+    # ── Detect deaths ─────────────────────────────────────────────────────
     for p in world.people:
         if p.name in alive_before and not p.isAlive:
             cause = 'starvation' if p.hunger <= 0 else 'old age' if p.age >= 80 else 'unknown'
@@ -117,7 +126,7 @@ while any(p.isAlive for p in world.people):
                 s['max_age']   = p.age
                 s['death_tick'] = tick
 
-    # ── Detect new buildings ──────────────────────────────────────────────────
+    # ── Detect new buildings ──────────────────────────────────────────────
     stats.huts_built        += len(world.huts)        - prev_huts
     stats.storehouses_built += len(world.storehouses) - prev_stores
 
@@ -128,10 +137,10 @@ while any(p.isAlive for p in world.people):
     if tick % 50 == 0:
         world.respawn_animals()
     world.apply_hut_healing()
-    world.recompute_population_cap()   # ← dynamic cap update each tick
+    world.recompute_population_cap()
     world.prune_dead()
 
-    # ── Live display ──────────────────────────────────────────────────────────
+    # ── Live display ──────────────────────────────────────────────────────
     alive_people  = [p for p in world.people if p.isAlive]
     pop           = len(alive_people)
     stats.peak_population = max(stats.peak_population, pop)
@@ -140,10 +149,38 @@ while any(p.isAlive for p in world.people):
     food_bonus  = world.storehouse_food_bonus()
     stored_food = world.total_stored_food()
 
+    # ── King panel ────────────────────────────────────────────────────────
     print(f"  ╔══════════════════════════════════════════════════════════╗")
     print(f"  ║  TICK: {tick:<6}  |  Pop: {pop}/{world.population_cap}  Peak: {stats.peak_population:<5}          ║")
-    print(f"  ║  Cap breakdown: base={world._base_pop_cap} + huts={hut_bonus} + food={food_bonus} (stored:{stored_food})   ║")
+    print(f"  ║  Cap: base={world._base_pop_cap} + huts={hut_bonus} + food={food_bonus} (stored:{stored_food:<4})         ║")
     print(f"  ╠══════════════════════════════════════════════════════════╣")
+
+    if world.king is not None:
+        k  = world.king
+        kp = k.person
+        rebel_count  = sum(1 for p in alive_people if getattr(p, 'is_rebel', False))
+        loyal_count  = sum(1 for p in alive_people
+                          if not getattr(p, 'is_rebel', False) and p is not kp)
+        avg_loyalty  = (sum(getattr(p, 'loyalty', 50) for p in alive_people if p is not kp)
+                        / max(1, len(alive_people) - 1))
+        mod_str = (f"+{k.coronation_modifier}" if k.coronation_modifier > 0
+                   else str(k.coronation_modifier) if k.coronation_modifier < 0 else " 0")
+        print(f"  ║  👑 KING: {kp.name:<8} I:{kp.intelligence:<3} Age:{kp.age:<3} Reign:{k.reign_ticks} ticks")
+        print(f"  ║     Ruler style: {k.style_name:<18} (INT base + roll {mod_str})")
+        print(f"  ║     Personality: tax={k.tax_amount} leniency={k.leniency} adapt={k.adapt_speed:.1f} skip@{int(k.starvation_skip*100)}%starv")
+        print(f"  ║     Build Zone : radius={k.build_radius} @ ({k.capital_x},{k.capital_y})  eagerness={k.radius_eagerness}")
+        print(f"  ║     Tax cycle  : {k.tax_timer}/{TAX_INTERVAL}  Taxed:{k.total_taxed}  Redist:{k.total_redistributed}  Dodged:{k.total_rebel_dodges}")
+        print(f"  ║     Starvation : {world.starvation_count}/{max(1,pop)*3} ticks (overthrow threshold)")
+        print(f"  ║     Loyalty    : avg={avg_loyalty:>4.0f}  Loyal={loyal_count}  Rebels={rebel_count}")
+        print(f"  ╠══════════════════════════════════════════════════════════╣")
+    elif world.council:
+        print(f"  ║  ⚖  INTERREGNUM — Council of {len(world.council)}:")
+        for cp in world.council:
+            print(f"  ║     {cp.name:<8} I:{cp.intelligence:<3}  Food:{cp.total_food_count()}")
+        print(f"  ╠══════════════════════════════════════════════════════════╣")
+    else:
+        print(f"  ║  (No ruler yet)                                          ║")
+        print(f"  ╠══════════════════════════════════════════════════════════╣")
 
     for p in alive_people:
         inv_f  = p.inventory_count('food')
@@ -155,9 +192,23 @@ while any(p.isAlive for p in world.people):
         inv_fi = p.inventory_count('fiber')
         cd     = f" CD:{p.birth_cooldown}" if p.birth_cooldown > 0 else ""
         gc     = f" GC:{p.gather_cooldown}" if p.gather_cooldown > 0 else ""
-        print(f"  ║  {p.name:<6} A:{p.age:<3} I:{p.intelligence:<3} LR:{p.learning_rate}{cd:<7}{gc}")
+
+        # Status badges
+        badge = ''
+        if getattr(p, 'is_king', False):
+            badge = ' 👑'
+        elif getattr(p, 'is_outcast', False):
+            badge = ' 🚫'
+        elif getattr(p, 'is_rebel', False):
+            badge = ' ⚡'
+
+        loyalty_str = ''
+        if world.king is not None and p is not world.king.person:
+            loyalty_str = f"  Loy:{draw_loyalty_bar(getattr(p, 'loyalty', 50))}"
+
+        print(f"  ║  {p.name:<6} A:{p.age:<3} I:{p.intelligence:<3} LR:{p.learning_rate}{badge}{cd:<7}{gc}")
         print(f"  ║    {draw_bar('HP', p.health)}  {draw_bar('HG', p.hunger)}")
-        print(f"  ║    Task:{p.current_task:<18} Inv[{len(p.inventory)}/25]")
+        print(f"  ║    Task:{p.current_task:<18} Inv[{len(p.inventory)}/25]{loyalty_str}")
         print(f"  ║    Food: F={inv_f} M={inv_m} H={inv_h} S={inv_s}  |  Res: W={inv_w} St={inv_st} Fi={inv_fi}")
         print(f"  ║    Farm:{'Yes' if p.has_farm else 'No':<4} Full:{'Yes' if p.farm_full else 'No':<4}")
         print(f"  ╠══════════════════════════════════════════════════════════╣")
@@ -167,6 +218,14 @@ while any(p.isAlive for p in world.people):
         for bt, bname, bparents in recent_births[-3:]:
             pstr = ' & '.join(bparents) if bparents else '?'
             print(f"  ║    Tick {bt:<6}: {bname} born  (parents: {pstr})")
+        print(f"  ╠══════════════════════════════════════════════════════════╣")
+
+    # ── Succession log (last 4 events) ────────────────────────────────────
+    if world.succession_log:
+        print(f"  ║  Succession log (recent):")
+        for st, sname, sreason in world.succession_log[-4:]:
+            icon = {'crowned': '👑', 'died': '💀', 'overthrown': '⚡', 'elected': '🗳'}.get(sreason, '?')
+            print(f"  ║    Tick {st:<6}: {sname:<8} — {icon} {sreason}")
         print(f"  ╠══════════════════════════════════════════════════════════╣")
 
     print(f"  ╚══════════════════════════════════════════════════════════╝")
@@ -190,10 +249,24 @@ print(f"""
   ║  Peak population: {stats.peak_population}
   ║  Total deaths:    {len(stats.deaths_log)}
   ║  Huts built:      {stats.huts_built}
-  ║  Storehouses:     {stats.storehouses_built}""")
+  ║  Storehouses:     {stats.storehouses_built}
+  ║  Total rulers:    {len(world.succession_log)}""")
 
 if longest:
     print(f"  ║  Longest lived:   {longest.name} (Age {longest.age})")
+
+# ── Succession history ────────────────────────────────────────────────────────
+if world.succession_log:
+    print(f"  ╠══════════════════════════════════════════════════════════════╣")
+    print(f"  ║  SUCCESSION HISTORY                                         ║")
+    print(f"  ╠══════════════════════════════════════════════════════════════╣")
+    for st, sname, sreason in world.succession_log:
+        icon = {'crowned': '👑', 'died': '💀', 'overthrown': '⚡', 'elected': '🗳'}.get(sreason, '?')
+        # Find style if king object still around
+        style_str = ''
+        if world.king and world.king.person.name == sname:
+            style_str = f"  [{world.king.style_name}]"
+        print(f"  ║    Tick {st:<6}: {sname:<8} — {icon} {sreason}{style_str}")
 
 print(f"  ╠══════════════════════════════════════════════════════════════╣")
 print(f"  ║  PERSON SUMMARIES                                           ║")

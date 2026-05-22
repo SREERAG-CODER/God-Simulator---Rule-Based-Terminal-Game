@@ -36,19 +36,23 @@ class Person:
         self.birth_cooldown = 0
 
         # Building state
-        self.build_target  = None   # BuildSite this person is contributing to
+        self.build_target  = None
 
         # Strategic gathering state
-        self.gather_cooldown   = 0   # ticks before this person may gather again
-        self.gather_target     = None  # ('wood'|'stone'|'fiber', tx, ty)
+        self.gather_cooldown   = 0
+        self.gather_target     = None
 
-        # Intelligence personality trait — rolled once at birth, inherited by children
-        # Range 1–8: slow learner (1) to fast learner (8)
-        # External code can pass learning_rate= to override (used in try_reproduce)
+        # Intelligence personality trait
         self.learning_rate = learning_rate if learning_rate is not None else random.randint(1, 8)
 
-        # XP accumulator — fractional intelligence gains pool here until >= 1.0
+        # XP accumulator
         self._xp_pool = 0.0
+
+        # ── King / governance fields ──────────────────────────────────────
+        self.is_king    = False          # True only for the crowned ruler
+        self.is_outcast = False          # True for dethroned kings
+        self.loyalty    = 50             # 0–100; below 25 = rebel
+        self.is_rebel   = False          # derived from loyalty each tick
 
     # ════════════════════════════════════════════════════════════
     # Inventory helpers
@@ -115,11 +119,6 @@ class Person:
             self.age += 1
 
     def _gain_xp(self, amount):
-        """
-        Add `amount` XP to the pool.  Every time the pool crosses a whole number,
-        intelligence increments by 1 (up to the 200 cap).
-        This keeps fractional gains from being silently discarded.
-        """
         if self.intelligence >= 200:
             return
         self._xp_pool += amount
@@ -129,12 +128,6 @@ class Person:
             self.intelligence = min(200, self.intelligence + gained)
 
     def intelligence_gain(self, tick):
-        """
-        Passive background learning — fires every 30 ticks.
-        Fast learners (LR=8) gain 4 XP/cycle; slow learners (LR=1) gain 0.5 XP/cycle.
-        That means a fast learner passively grows ~8x faster than a slow one.
-        Active XP (from doing things) is added separately via _gain_xp().
-        """
         if tick % 30 == 0:
             self._gain_xp(self.learning_rate * 0.5)
 
@@ -236,7 +229,6 @@ class Person:
     # Strategic resource gathering
     # ════════════════════════════════════════════════════════════
     def _world_resource_counts(self, world):
-        """Count how many of each resource all living people carry in total."""
         totals = {'wood': 0, 'stone': 0, 'fiber': 0}
         for p in world.people:
             if p.isAlive:
@@ -245,10 +237,6 @@ class Person:
         return totals
 
     def _resource_target_amounts(self, world):
-        """
-        How many of each resource the civilization ideally wants to stockpile.
-        Scales with population: more people = more building demand.
-        """
         pop = max(1, len(world.people))
         return {
             'wood':  max(8,  pop * 2),
@@ -257,32 +245,20 @@ class Person:
         }
 
     def try_strategic_gather(self, world):
-        """
-        Proactively gather resources when well-fed and not building.
-        Only runs when hunger > 60, health > 60, no active build task,
-        gather_cooldown == 0, and the civilization is short on a resource.
-
-        Intelligence gates:
-          >= 40  →  can gather fiber
-          >= 55  →  can also gather wood
-          >= 70  →  can also gather stone
-        """
         if self.gather_cooldown > 0:
             return False
         if self.hunger < 60 or self.health < 60:
             return False
-        # Don't gather if already carrying a full load of resources
         res_carried = (self.inventory_count('wood') +
                        self.inventory_count('stone') +
                        self.inventory_count('fiber'))
         if res_carried >= 4:
-            self.gather_cooldown = 20   # pause before checking again
+            self.gather_cooldown = 20
             return False
 
         have   = self._world_resource_counts(world)
         target = self._resource_target_amounts(world)
 
-        # Build priority list from most-needed to least-needed
         priority = []
         if self.intelligence >= 55 and have['wood']  < target['wood']:
             priority.append(('wood',  target['wood']  - have['wood']))
@@ -294,7 +270,6 @@ class Person:
         if not priority:
             return False
 
-        # Pick the most-needed resource
         priority.sort(key=lambda x: -x[1])
         resource = priority[0][0]
 
@@ -307,10 +282,9 @@ class Person:
         gathered = self._gather_resource(world, terrain_type, resource, spent)
         if gathered:
             self.current_task     = f'stockpiling_{resource}'
-            self.gather_cooldown  = 10   # short pause between gather steps
+            self.gather_cooldown  = 10
             return True
 
-        # Nothing in range — long cooldown to avoid wasting ticks
         self.gather_cooldown = 40
         return False
 
@@ -332,13 +306,25 @@ class Person:
             return self.gather_fiber(world)
         return False
 
-    def propose_build_site(self, world, kind):
+    def _propose_build_site_in_zone(self, world, kind):
+        """
+        Propose a build site.  Loyal people must stay inside the King's build zone.
+        Rebels and people without a King build anywhere.
+        """
         from Building import BuildSite
         MIN_DIST = 8
+
+        king = world.king
 
         for _ in range(200):
             x = random.randint(1, world.width - 2)
             y = random.randint(1, world.height - 2)
+
+            # ── Enforce build zone for loyal subjects ─────────────────────
+            if king is not None and not self.is_rebel:
+                if not king.in_build_zone(x, y):
+                    continue
+
             tile = world.grid[y][x]
             if tile.terrain != 'grass' or tile.civilization is not None:
                 continue
@@ -353,6 +339,10 @@ class Person:
             if not too_close:
                 return world.add_build_site(kind, x, y)
         return None
+
+    def propose_build_site(self, world, kind):
+        """Public alias kept for compatibility."""
+        return self._propose_build_site_in_zone(world, kind)
 
     def try_contribute_to_build(self, world):
         from Building import BuildSite
@@ -370,6 +360,10 @@ class Person:
         for site in world.build_sites:
             if site.kind == 'storehouse' and not can_storehouse:
                 continue
+            # Loyal subjects only work on sites inside the King's zone
+            if world.king is not None and not self.is_rebel:
+                if not world.king.in_build_zone(site.x, site.y):
+                    continue
             d = abs(site.x - self.x) + abs(site.y - self.y)
             if d < target_dist:
                 target_dist = d
@@ -378,11 +372,11 @@ class Person:
         if target_site is None:
             if can_storehouse and not any(s.kind == 'storehouse' for s in world.build_sites):
                 if len(world.storehouses) < max(1, len(world.people) // 8):
-                    target_site = self.propose_build_site(world, 'storehouse')
+                    target_site = self._propose_build_site_in_zone(world, 'storehouse')
             if target_site is None and can_hut:
                 if len(world.huts) < max(1, len(world.people) // 5):
                     if not any(s.kind == 'hut' for s in world.build_sites):
-                        target_site = self.propose_build_site(world, 'hut')
+                        target_site = self._propose_build_site_in_zone(world, 'hut')
 
         if target_site is None:
             return False
@@ -395,10 +389,8 @@ class Person:
             self.current_task = 'building'
             contributed = target_site.contribute(self)
             if contributed:
-                # Building is cognitively demanding — bigger XP, scaled by LR
                 self._gain_xp(1.5 + self.learning_rate * 0.2)
             if target_site.is_complete():
-                # Finishing a structure gives a bonus burst
                 self._gain_xp(3.0)
                 world.complete_build_site(target_site)
                 self.build_target = None
@@ -423,10 +415,9 @@ class Person:
         return False
 
     # ════════════════════════════════════════════════════════════
-    # Hut healing — seek hut when hurt
+    # Hut healing
     # ════════════════════════════════════════════════════════════
     def try_seek_hut(self, world):
-        # FIX: import directly instead of using the roundabout module-level helper
         from Building import Hut
         if self.health >= 60 or not world.huts:
             return False
@@ -436,7 +427,7 @@ class Person:
             return False
 
         dist = abs(self.x - hut.x) + abs(self.y - hut.y)
-        if dist <= Hut.HEAL_RADIUS:          # FIX: direct class constant
+        if dist <= Hut.HEAL_RADIUS:
             self.current_task = 'healing'
             return True
 
@@ -457,7 +448,6 @@ class Person:
     # Storehouse interactions
     # ════════════════════════════════════════════════════════════
     def try_deposit_to_storehouse(self, world):
-        # FIX: import directly instead of using the roundabout module-level helper
         from Building import Storehouse
         if not world.storehouses:
             return False
@@ -469,7 +459,7 @@ class Person:
             return False
 
         dist = abs(self.x - sh.x) + abs(self.y - sh.y)
-        if dist <= Storehouse.INTERACT_RADIUS:   # FIX: direct class constant
+        if dist <= Storehouse.INTERACT_RADIUS:
             deposited = sh.deposit(self)
             if deposited:
                 self.current_task = 'depositing'
@@ -489,7 +479,6 @@ class Person:
         return False
 
     def try_withdraw_from_storehouse(self, world):
-        # FIX: import directly instead of using the roundabout module-level helper
         from Building import Storehouse
         if not world.storehouses:
             return False
@@ -501,7 +490,7 @@ class Person:
             return False
 
         dist = abs(self.x - sh.x) + abs(self.y - sh.y)
-        if dist <= Storehouse.INTERACT_RADIUS:   # FIX: direct class constant
+        if dist <= Storehouse.INTERACT_RADIUS:
             withdrawn = sh.withdraw(self)
             if withdrawn:
                 self.current_task = 'withdrawing'
@@ -546,7 +535,7 @@ class Person:
                     world.grid[ty][tx].civilization = None
                     world.animals.remove(animal)
                     self.add_to_inventory('meat')
-                    self._gain_xp(1.0 + self.learning_rate * 0.15)  # hunting teaches tracking & timing
+                    self._gain_xp(1.0 + self.learning_rate * 0.15)
                     self.current_task = 'roaming'
                     return
 
@@ -597,7 +586,7 @@ class Person:
                             tile.terrain    = 'farm'
                             tile.grow_timer = 0
                             self.remove_item('seed')
-                            self._gain_xp(0.3)   # small boost for planning ahead
+                            self._gain_xp(0.3)
                             self.current_task = 'farming'
                             return
         self.farm_full = True
@@ -618,7 +607,7 @@ class Person:
                     tile.grow_timer = 0
                     self.add_to_inventory('harvested')
                     self.add_to_inventory('seed')
-                    self._gain_xp(0.8 + self.learning_rate * 0.1)  # farming teaches patience & cycles
+                    self._gain_xp(0.8 + self.learning_rate * 0.1)
                     self.current_task = 'planting'
                     self.farm_full    = False
                     return True
@@ -637,7 +626,7 @@ class Person:
         return False
 
     # ════════════════════════════════════════════════════════════
-    # Food sharing
+    # Food sharing  (outcasts are skipped as recipients)
     # ════════════════════════════════════════════════════════════
     def try_share_food(self, world):
         if self.hunger <= 50:
@@ -649,6 +638,8 @@ class Person:
         for other in world.people:
             if other is self or not other.isAlive or other.hunger >= 30:
                 continue
+            if getattr(other, 'is_outcast', False):
+                continue                        # don't share with outcast kings
             if abs(self.x - other.x) + abs(self.y - other.y) <= 1:
                 neighbours.append(other)
         if not neighbours:
@@ -666,14 +657,6 @@ class Person:
     # Reproduction
     # ════════════════════════════════════════════════════════════
     def seek_partner(self, world):
-        """
-        Move toward a valid reproduction partner.
-        FIX: the original returned False if *any* partner was within dist<=2,
-        which prevented reproduction entirely. Now we only skip movement if
-        THIS person is already adjacent to a valid partner (reproduction will
-        fire via try_reproduce instead). We still return True so the caller
-        knows not to fall through to generic move().
-        """
         if self.birth_cooldown > 0: return False
         if self.health < 70 or self.hunger < 40 or self.intelligence < 50: return False
         if self.age < 15: return False
@@ -686,10 +669,8 @@ class Person:
             if other.health < 70 or other.hunger < 40 or other.intelligence < 50: continue
             if other.age < 15: continue
             dist = abs(self.x - other.x) + abs(self.y - other.y)
-            # FIX: was `if dist <= 2: return False` — that killed all reproduction.
-            # Now: if already adjacent, stop here and let try_reproduce() handle it.
             if dist <= 2:
-                return True   # already close enough; don't move, signal "handled"
+                return True
             if dist < best_dist:
                 best_dist = dist
                 best      = other
@@ -739,11 +720,9 @@ class Person:
             available   = [n for n in CHILD_NAMES if n not in used_names]
             child_name  = available[0] if available else f"Child{len(world.people)}"
 
-            # Intelligence: blend of parents + small random noise
             child_intel = int((self.intelligence + other.intelligence) / 2)
             child_intel = max(10, min(200, child_intel + random.randint(-10, 10)))
 
-            # Learning rate: blend of parents, mutate by ±1, clamp 1–8
             child_lr = round((self.learning_rate + other.learning_rate) / 2)
             child_lr = max(1, min(8, child_lr + random.choice([-1, 0, 0, 1])))
 
