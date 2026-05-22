@@ -11,14 +11,14 @@ def draw_bar(label, value, max_value=100, length=15):
 # ── Stat tracking ─────────────────────────────────────────────────────────────
 class Stats:
     def __init__(self):
-        self.total_born       = 0
-        self.births_log       = []   # (tick, child_name, parent_names)
-        self.deaths_log       = []   # (tick, name, age, cause)
-        self.peak_population  = 0
-        self.huts_built       = 0
-        self.storehouses_built= 0
+        self.total_born        = 0
+        self.births_log        = []   # (tick, child_name, parent_names)
+        self.deaths_log        = []   # (tick, name, age, cause)
+        self.peak_population   = 0
+        self.huts_built        = 0
+        self.storehouses_built = 0
         # per-person lifetime stats: name → dict
-        self.person_stats     = {}
+        self.person_stats      = {}
 
     def register_person(self, person):
         if person.name not in self.person_stats:
@@ -36,57 +36,20 @@ class Stats:
         s['max_age']   = max(s['max_age'],   person.age)
         s['max_intel'] = max(s['max_intel'], person.intelligence)
 
+    def record_inventory_gains(self, person, old_inv):
+        """Diff inventory before/after a tick and credit new items to person stats."""
+        s = self.person_stats.get(person.name)
+        if s is None:
+            return
+        new_inv = person.inventory[:]
+        for item in new_inv:
+            if item in old_inv:
+                old_inv.remove(item)
+            else:
+                if item in s:
+                    s[item] += 1
+
 stats = Stats()
-
-# ── Inventory diff helper ─────────────────────────────────────────────────────
-def record_inventory_gains(person, old_inv):
-    s = stats.person_stats.get(person.name)
-    if s is None:
-        return
-    new_inv = person.inventory[:]
-    for item in new_inv:
-        if item in old_inv:
-            old_inv.remove(item)
-        else:
-            if item in s:
-                s[item] += 1
-
-def run_person_tick(person, world, tick):
-    person.update_hunger(tick)
-    person.age_up(tick)
-    person.intelligence_gain(tick)
-    person.tick_cooldowns()
-
-    if not person.isAlive:
-        return
-
-    old_inv = person.inventory[:]
-
-    if person.hunger < 30 and not person.has_edible_food():
-        person.hunt(world)
-        if person.current_task == 'hunting':
-            person.move(world, tick)
-    else:
-        if person.has_farm:
-            person.try_harvest(world)
-            if person.current_task != 'harvesting':
-                person.try_collect_seed(world)
-                person.try_plant(world)
-                if not person.seek_partner(world):
-                    person.move(world, tick)
-        else:
-            person.try_collect_seed(world)
-            person.try_plant(world)
-            if not person.seek_partner(world):
-                person.move(world, tick)
-
-    person.try_share_food(world)
-
-    if person.health >= 70 and person.hunger >= 40 and person.birth_cooldown == 0 and person.age >= 15:
-        person.try_reproduce(world)
-
-    record_inventory_gains(person, old_inv)
-    stats.snapshot(person)
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 world = World(50, 50, population_cap=20)
@@ -119,14 +82,16 @@ while any(p.isAlive for p in world.people):
     os.system('cls' if os.name == 'nt' else 'clear')
     tick += 1
 
-    prev_people   = set(id(p) for p in world.people)
-    prev_huts     = len(world.huts)
-    prev_stores   = len(world.storehouses)
-    alive_before  = {p.name for p in world.people if p.isAlive}
+    prev_people  = set(id(p) for p in world.people)
+    prev_huts    = len(world.huts)
+    prev_stores  = len(world.storehouses)
+    alive_before = {p.name for p in world.people if p.isAlive}
 
     for person in list(world.people):
         if person.isAlive:
-            run_person_tick(person, world, tick)
+            old_inv = person.tick(world, tick)   # ← all behaviour now in Person.tick()
+            stats.record_inventory_gains(person, old_inv)
+            stats.snapshot(person)
 
     # ── Detect births ─────────────────────────────────────────────────────────
     for p in world.people:
@@ -149,16 +114,17 @@ while any(p.isAlive for p in world.people):
             if s:
                 s['max_age'] = p.age
 
-    # ── Detect new buildings ───────────────────────────────────────────────────
+    # ── Detect new buildings ──────────────────────────────────────────────────
     stats.huts_built        += len(world.huts)        - prev_huts
     stats.storehouses_built += len(world.storehouses) - prev_stores
 
     # World updates
     world.grow_farms()
+    world.update_regrowth()
     world.update_animals(tick)
     if tick % 50 == 0:
         world.respawn_animals()
-
+    world.apply_hut_healing()
     world.prune_dead()
 
     # ── Live display ──────────────────────────────────────────────────────────
@@ -202,10 +168,7 @@ while any(p.isAlive for p in world.people):
 # ── End screen ────────────────────────────────────────────────────────────────
 os.system('cls' if os.name == 'nt' else 'clear')
 
-all_people = list(stats.person_stats.items())
 longest    = max(world.people, key=lambda p: p.age, default=None)
-
-# fix: count from all tracked people, not just alive
 total_born = stats.total_born
 
 print(f"""
@@ -232,7 +195,7 @@ for name, s in stats.person_stats.items():
     print(f"  ║  {name:<8}  Age:{s['max_age']:<4} Intel:{s['max_intel']:<4}")
     print(f"  ║    Food gathered : food={s['food']} harvested={s['harvested']} meat={s['meat']} (total={total_food})")
     print(f"  ║    Res gathered  : wood={s['wood']} stone={s['stone']} fiber={s['fiber']} (total={total_res})")
-    print(f"  ╠══════════════════════════════════════════════════════════════╣")
+    print(f"  ╠══════════════════════════════════════════════════════════╣")
 
 # ── Full births log ───────────────────────────────────────────────────────────
 print(f"  ║  FULL BIRTHS LOG                                            ║")
@@ -243,9 +206,9 @@ for bt, bname, bparents in stats.births_log:
 
 # ── Deaths log ────────────────────────────────────────────────────────────────
 if stats.deaths_log:
-    print(f"  ╠══════════════════════════════════════════════════════════════╣")
+    print(f"  ╠══════════════════════════════════════════════════════════╣")
     print(f"  ║  DEATHS LOG                                                 ║")
-    print(f"  ╠══════════════════════════════════════════════════════════════╣")
+    print(f"  ╠══════════════════════════════════════════════════════════╣")
     for dt, dname, dage, cause in stats.deaths_log:
         print(f"  ║    Tick {dt:<6}: {dname:<8} died age {dage:<4} ({cause})")
 

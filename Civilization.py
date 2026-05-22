@@ -149,11 +149,6 @@ class Person:
     # Resource gathering  (wood / stone / fiber)
     # ════════════════════════════════════════════════════════════
     def _gather_resource(self, world, terrain_type, item_name, spent_terrain, radius=12):
-        """
-        BFS-walk toward the nearest tile of `terrain_type` within `radius`.
-        On arrival, collect the resource and mark tile as `spent_terrain`.
-        Returns True if gathered or moved toward one.
-        """
         best_dist = radius + 1
         best_pos  = None
 
@@ -173,13 +168,11 @@ class Person:
 
         tx, ty = best_pos
 
-        # Adjacent — collect
         if abs(self.x - tx) <= 1 and abs(self.y - ty) <= 1 and (self.x != tx or self.y != ty):
             world.grid[ty][tx].terrain = spent_terrain
             self.add_to_inventory(item_name)
             return True
 
-        # Move toward
         step = self._find_path_step(world, tx, ty)
         if step:
             ox, oy  = step
@@ -209,17 +202,12 @@ class Person:
     # Building logic
     # ════════════════════════════════════════════════════════════
     def _has_materials_for(self, recipe):
-        """Check if this person carries at least some of what's still needed."""
         for resource, amount in recipe.items():
             if amount > 0 and self.has_item(resource):
                 return True
         return False
 
     def _gather_for_recipe(self, world, recipe):
-        """
-        Try to gather whichever resource in recipe we still lack.
-        Returns True if action taken.
-        """
         if recipe.get('wood', 0) > 0 and not self.has_item('wood'):
             return self.gather_wood(world)
         if recipe.get('stone', 0) > 0 and not self.has_item('stone'):
@@ -229,12 +217,8 @@ class Person:
         return False
 
     def propose_build_site(self, world, kind):
-        """
-        Find a free grass tile not too close to existing buildings and
-        register a new BuildSite. Returns the site or None.
-        """
         from Building import BuildSite
-        MIN_DIST = 8   # minimum tiles away from existing buildings
+        MIN_DIST = 8
 
         for _ in range(200):
             x = random.randint(1, world.width - 2)
@@ -242,7 +226,6 @@ class Person:
             tile = world.grid[y][x]
             if tile.terrain != 'grass' or tile.civilization is not None:
                 continue
-            # Check not too close to existing huts/storehouses
             too_close = False
             for blist in (world.huts, world.storehouses, world.build_sites):
                 for b in blist:
@@ -256,17 +239,8 @@ class Person:
         return None
 
     def try_contribute_to_build(self, world):
-        """
-        Main building action called each tick.
-        Priority:
-          1. If a build site exists that needs what we carry → go contribute.
-          2. If we are assigned a site, gather materials for it.
-          3. If intelligence allows and no site exists, propose one.
-        Returns True if action taken (moved or contributed).
-        """
         from Building import BuildSite
 
-        # ── Determine what we can build ──────────────────────────────────────
         can_hut        = self.intelligence >= INT_BUILD_HUT
         can_storehouse = (self.intelligence >= INT_BUILD_STOREHOUSE and
                           len(world.huts) > 0)
@@ -274,29 +248,22 @@ class Person:
         if not can_hut:
             return False
 
-        # ── Find nearest site we can contribute to ───────────────────────────
         target_site = None
         target_dist = 9999
 
         for site in world.build_sites:
-            # Only help sites matching our capability
             if site.kind == 'storehouse' and not can_storehouse:
                 continue
             d = abs(site.x - self.x) + abs(site.y - self.y)
             if d < target_dist:
-                # Does the site still need something we carry or can gather?
                 target_dist = d
                 target_site = site
 
-        # ── Propose a new site if none exists ────────────────────────────────
         if target_site is None:
-            # Avoid spamming: only propose if no site of that kind exists
             if can_storehouse and not any(s.kind == 'storehouse' for s in world.build_sites):
-                # Check if we need a new storehouse (1 per 8 people heuristic)
                 if len(world.storehouses) < max(1, len(world.people) // 8):
                     target_site = self.propose_build_site(world, 'storehouse')
             if target_site is None and can_hut:
-                # 1 hut per 5 people heuristic
                 if len(world.huts) < max(1, len(world.people) // 5):
                     if not any(s.kind == 'hut' for s in world.build_sites):
                         target_site = self.propose_build_site(world, 'hut')
@@ -307,7 +274,6 @@ class Person:
         self.build_target = target_site
         recipe_needed     = target_site.needed
 
-        # ── If adjacent to site and carry materials → contribute ─────────────
         dist = abs(self.x - target_site.x) + abs(self.y - target_site.y)
         if dist <= 1 and self._has_materials_for(recipe_needed):
             self.current_task = 'building'
@@ -317,10 +283,8 @@ class Person:
                 self.build_target = None
             return contributed
 
-        # ── Need to gather materials first ───────────────────────────────────
         still_needed = {k: v for k, v in recipe_needed.items() if v > 0}
         if self._has_materials_for(still_needed):
-            # Walk to the build site
             self.current_task = 'building'
             step = self._find_path_step(world, target_site.x, target_site.y)
             if step:
@@ -333,7 +297,6 @@ class Person:
                     world.grid[self.y][self.x].civilization = self
                     return True
         else:
-            # Gather what's missing
             return self._gather_for_recipe(world, still_needed)
 
         return False
@@ -342,11 +305,6 @@ class Person:
     # Hut healing — seek hut when hurt
     # ════════════════════════════════════════════════════════════
     def try_seek_hut(self, world):
-        """
-        If health below 60 and a hut exists, BFS-walk toward the nearest hut.
-        Healing is passive (applied by world.apply_hut_healing each tick).
-        Returns True if moved toward hut.
-        """
         if self.health >= 60 or not world.huts:
             return False
 
@@ -357,7 +315,7 @@ class Person:
         dist = abs(self.x - hut.x) + abs(self.y - hut.y)
         if dist <= Hut_HEAL_RADIUS(hut):
             self.current_task = 'healing'
-            return True   # already in range, just stay
+            return True
 
         self.current_task = 'seeking_hut'
         step = self._find_path_step(world, hut.x, hut.y)
@@ -376,10 +334,6 @@ class Person:
     # Storehouse interactions
     # ════════════════════════════════════════════════════════════
     def try_deposit_to_storehouse(self, world):
-        """
-        If carrying > 10 food items, walk to nearest storehouse and deposit.
-        Returns True if action taken.
-        """
         if not world.storehouses:
             return False
         if self.total_food_count() <= 10:
@@ -410,10 +364,6 @@ class Person:
         return False
 
     def try_withdraw_from_storehouse(self, world):
-        """
-        If hungry and no food in inventory, try to withdraw from nearest storehouse.
-        Returns True if withdrew food.
-        """
         if not world.storehouses:
             return False
         if self.hunger > 30 or self.has_edible_food():
@@ -681,6 +631,75 @@ class Person:
                     world.grid[self.y][self.x].civilization = self
                     return True
         return False
+
+    # ════════════════════════════════════════════════════════════
+    # MAIN TICK  ←  moved from main.py's run_person_tick()
+    # ════════════════════════════════════════════════════════════
+    def tick(self, world, tick_num):
+        """
+        Drive one simulation step for this person.
+        Returns the inventory snapshot taken BEFORE the tick so that
+        main.py can call record_inventory_gains(person, old_inv).
+        """
+        self.update_hunger(tick_num)
+        self.age_up(tick_num)
+        self.intelligence_gain(tick_num)
+        self.tick_cooldowns()
+
+        if not self.isAlive:
+            return []   # nothing to record
+
+        old_inv = self.inventory[:]
+
+        # ── Survival first: eat / hunt if starving ────────────────────────
+        if self.hunger < 30 and not self.has_edible_food():
+            # Try storehouse withdrawal before hunting
+            if not self.try_withdraw_from_storehouse(world):
+                self.hunt(world)
+                if self.current_task == 'hunting':
+                    self.move(world, tick_num)
+            return old_inv
+
+        # ── Seek hut if injured ───────────────────────────────────────────
+        if self.try_seek_hut(world):
+            return old_inv
+
+        # ── Deposit surplus food to storehouse ────────────────────────────
+        if self.try_deposit_to_storehouse(world):
+            return old_inv
+
+        # ── Building takes priority over farming when smart enough ────────
+        # Only attempt every 3 ticks (staggered by name hash) to avoid monopolising
+        if (self.intelligence >= 50 and
+                tick_num % 3 == (hash(self.name) % 3)):
+            if self.try_contribute_to_build(world):
+                self.try_share_food(world)
+                if (self.health >= 70 and self.hunger >= 40 and
+                        self.birth_cooldown == 0 and self.age >= 15):
+                    self.try_reproduce(world)
+                return old_inv
+
+        # ── Farming pipeline ──────────────────────────────────────────────
+        if self.has_farm:
+            self.try_harvest(world)
+            if self.current_task != 'harvesting':
+                self.try_collect_seed(world)
+                self.try_plant(world)
+                if not self.seek_partner(world):
+                    self.move(world, tick_num)
+        else:
+            self.try_collect_seed(world)
+            self.try_plant(world)
+            if not self.seek_partner(world):
+                self.move(world, tick_num)
+
+        # ── Social actions ────────────────────────────────────────────────
+        self.try_share_food(world)
+        if (self.health >= 70 and self.hunger >= 40 and
+                self.birth_cooldown == 0 and self.age >= 15):
+            self.try_reproduce(world)
+
+        return old_inv
 
 
 # ── Module-level helpers (avoid circular import) ─────────────────────────────
