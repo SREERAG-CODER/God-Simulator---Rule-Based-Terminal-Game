@@ -41,7 +41,7 @@ class Person:
         self.farm_full     = False
         self.current_task  = 'roaming'
         self.birth_cooldown = 0
-
+        self.parent_names = []  # set at birth
         # Building state
         self.build_target  = None
 
@@ -794,6 +794,7 @@ class Person:
                 world.grid[cy][cx].terrain = 'grass'
 
             child  = Person(child_name, cx, cy, intelligence=child_intel, learning_rate=child_lr)
+            child.parent_names = [self.name, other.name] 
             world.grid[cy][cx].civilization = child
             world.people.append(child)
             return child

@@ -1,21 +1,28 @@
-# King.py
-# Governs the civilisation: sets build zone, collects taxes, can be overthrown.
-# King personality is derived from intelligence + a random coronation modifier.
+# King.py  (fixed)
+# Changes vs original:
+#   • POST_ELECTION_IMMUNITY — new king cannot be overthrown for N ticks
+#   • Rebels are EXCLUDED from the starvation/overthrow counter
+#   • On election, rebel loyalty is partially reset (drift toward 40) so the
+#     cycle breaks naturally
+#   • _derive_style is called ONCE at coronation — style never changes after
 
 import random
 
 # ── Build zone ────────────────────────────────────────────────────────────────
 INITIAL_BUILD_RADIUS   = 10
-RADIUS_GROWTH_PER_POP  = 5    # +5 radius for every 5 people
+RADIUS_GROWTH_PER_POP  = 5
 RADIUS_POP_STEP        = 5
 
-# ── Taxation (base defaults — overridden per style) ───────────────────────────
-TAX_INTERVAL           = 100  # ticks between tax collection cycles
+# ── Taxation ──────────────────────────────────────────────────────────────────
+TAX_INTERVAL           = 100
 
 # ── Overthrow ─────────────────────────────────────────────────────────────────
 STARVATION_THRESHOLD_PER_PERSON = 3
 LOYALTY_REBEL_THRESHOLD         = 25
 LOYALTY_LOYAL_THRESHOLD         = 75
+
+# FIX 2: new king is immune to overthrow for this many ticks
+POST_ELECTION_IMMUNITY  = 500
 
 # ── Loyalty drift ─────────────────────────────────────────────────────────────
 LOYALTY_GAIN_WELL_FED        =  1
@@ -25,72 +32,35 @@ LOYALTY_GAIN_REDISTRIB       =  5
 LOYALTY_LOSS_KING_WEAK       = -1
 LOYALTY_GAIN_FED_BY_KING     =  8
 
+# ── How much rebel loyalty drifts up toward neutral after a new election ──────
+REBEL_AMNESTY_LOYALTY_BOOST  = 15   # added to every rebel's loyalty on coronation
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Ruling style profiles
-# Each style defines concrete numeric behaviour for the King.
-# ══════════════════════════════════════════════════════════════════════════════
 
 STYLES = {
-    # name            tax_amount  leniency  adapt  starvation_skip  radius_eagerness
-    # tax_amount        : food items collected per person per cycle
-    # leniency          : surplus a person must have ABOVE tax before they're taxed
-    #                     (higher = king gives more slack to poor people)
-    # adapt_speed       : multiplier on LR when adjusting tax rate (0 = never adapts)
-    # starvation_skip   : if this fraction of pop is starving, skip tax this cycle
-    #                     (0.0 = never skips, 1.0 = always skips when anyone starving)
-    # radius_eagerness  : extra radius added proactively per 3 people (0 = reactive only)
-    'Ruthless Brute':   dict(tax_amount=3, leniency=1, adapt_speed=0.0, starvation_skip=0.0, radius_eagerness=0),
-    'Brute':            dict(tax_amount=2, leniency=2, adapt_speed=0.0, starvation_skip=0.0, radius_eagerness=1),
-    'Firm':             dict(tax_amount=2, leniency=3, adapt_speed=0.5, starvation_skip=0.1, radius_eagerness=2),
-    'Balanced':         dict(tax_amount=1, leniency=3, adapt_speed=1.0, starvation_skip=0.2, radius_eagerness=3),
-    'Wise':             dict(tax_amount=1, leniency=4, adapt_speed=1.5, starvation_skip=0.3, radius_eagerness=4),
-    'Benevolent Wise':  dict(tax_amount=1, leniency=5, adapt_speed=2.0, starvation_skip=0.4, radius_eagerness=5),
+    'Ruthless Brute':  dict(tax_amount=3, leniency=1, adapt_speed=0.0, starvation_skip=0.0, radius_eagerness=0),
+    'Brute':           dict(tax_amount=2, leniency=2, adapt_speed=0.0, starvation_skip=0.0, radius_eagerness=1),
+    'Firm':            dict(tax_amount=2, leniency=3, adapt_speed=0.5, starvation_skip=0.1, radius_eagerness=2),
+    'Balanced':        dict(tax_amount=1, leniency=3, adapt_speed=1.0, starvation_skip=0.2, radius_eagerness=3),
+    'Wise':            dict(tax_amount=1, leniency=4, adapt_speed=1.5, starvation_skip=0.3, radius_eagerness=4),
+    'Benevolent Wise': dict(tax_amount=1, leniency=5, adapt_speed=2.0, starvation_skip=0.4, radius_eagerness=5),
 }
 
-# Ordered list for stepping up/down
 STYLE_ORDER = [
-    'Ruthless Brute',
-    'Brute',
-    'Firm',
-    'Balanced',
-    'Wise',
-    'Benevolent Wise',
+    'Ruthless Brute', 'Brute', 'Firm', 'Balanced', 'Wise', 'Benevolent Wise',
 ]
 
 def _derive_style(person):
-    """
-    Base style from intelligence, then shift by a random coronation modifier.
-    Returns (style_name, modifier_applied).
-    """
     intel = person.intelligence
-
-    if intel < 50:
-        base_idx = 0   # Ruthless Brute
-    elif intel < 80:
-        base_idx = 2   # Firm
-    elif intel < 120:
-        base_idx = 3   # Balanced
-    else:
-        base_idx = 4   # Wise
-
-    # Random modifier: -1 / 0 / +1, weighted so 0 is most likely
-    modifier = random.choices([-1, 0, 1], weights=[25, 50, 25])[0]
+    if intel < 50:   base_idx = 0
+    elif intel < 80: base_idx = 2
+    elif intel < 120:base_idx = 3
+    else:            base_idx = 4
+    modifier  = random.choices([-1, 0, 1], weights=[25, 50, 25])[0]
     final_idx = max(0, min(len(STYLE_ORDER) - 1, base_idx + modifier))
-
     return STYLE_ORDER[final_idx], modifier
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# King class
-# ══════════════════════════════════════════════════════════════════════════════
-
 class King:
-    """
-    Wraps a Person reference and adds governance behaviour.
-    The Person still ticks normally; King adds an extra governance layer on top.
-    """
-
     def __init__(self, person, world_tick):
         self.person        = person
         self.capital_x     = person.x
@@ -103,30 +73,27 @@ class King:
         self.total_redistributed     = 0
         self.total_rebel_dodges      = 0
 
-        # ── Derive personality ────────────────────────────────────────────
+        # FIX 2: immunity counter — cannot be overthrown while > 0
+        self.immunity_ticks = POST_ELECTION_IMMUNITY
+
+        # FIX 3: style derived ONCE here, never again
         self.style_name, self.coronation_modifier = _derive_style(person)
         profile = STYLES[self.style_name]
 
-        self.tax_amount        = profile['tax_amount']        # current (can adapt)
-        self._base_tax_amount  = profile['tax_amount']        # anchor for adaptation
+        self.tax_amount        = profile['tax_amount']
+        self._base_tax_amount  = profile['tax_amount']
         self.leniency          = profile['leniency']
         self.adapt_speed       = profile['adapt_speed']
         self.starvation_skip   = profile['starvation_skip']
         self.radius_eagerness  = profile['radius_eagerness']
 
-        # Adaptation memory: track last cycle's starvation fraction
         self._last_starving_fraction = 0.0
 
-        # Mark the person
         person.symbol  = 'K'
         person.is_king = True
 
     # ── Build zone ────────────────────────────────────────────────────────────
     def update_build_radius(self, population):
-        """
-        Base expansion from population.
-        Eager rulers (high radius_eagerness) add a proactive bonus on top.
-        """
         base_bonus  = (population // RADIUS_POP_STEP) * RADIUS_GROWTH_PER_POP
         eager_bonus = (population // 3) * self.radius_eagerness
         self.build_radius = INITIAL_BUILD_RADIUS + base_bonus + eager_bonus
@@ -136,35 +103,21 @@ class King:
 
     # ── Adaptation ────────────────────────────────────────────────────────────
     def _adapt_tax_rate(self, world):
-        """
-        Adaptive kings (adapt_speed > 0) adjust tax_amount each cycle based on
-        how bad starvation was last cycle and the king's learning_rate.
-
-        Formula:
-          effective_adapt = adapt_speed * (learning_rate / 4)
-          If starvation fraction > starvation_skip threshold → lower tax by 1
-          If starvation fraction == 0 and storehouse well-stocked → raise by 1
-          Always clamped to [1, base_tax_amount + 2]
-        """
         if self.adapt_speed == 0:
-            return  # Brutes never adapt
-
+            return
         lr     = self.person.learning_rate
         factor = self.adapt_speed * (lr / 4.0)
-
-        pop            = max(1, len(world.people))
-        starving_now   = sum(1 for p in world.people if p.isAlive and p.hunger <= 20)
-        starving_frac  = starving_now / pop
-
-        stored = world.total_stored_food()
-
+        pop           = max(1, len(world.people))
+        # FIX 2: only count non-rebel starvation for adaptation too
+        starving_now  = sum(1 for p in world.people
+                            if p.isAlive and p.hunger <= 20
+                            and not getattr(p, 'is_rebel', False))
+        starving_frac = starving_now / pop
+        stored        = world.total_stored_food()
         if starving_frac > self.starvation_skip and random.random() < factor:
-            # People are suffering — compassionate/wise king reduces tax
             self.tax_amount = max(1, self.tax_amount - 1)
         elif starving_frac == 0 and stored > pop * 3 and random.random() < factor * 0.5:
-            # Storehouse overflowing, nobody starving — raise tax back toward base
             self.tax_amount = min(self._base_tax_amount + 2, self.tax_amount + 1)
-
         self._last_starving_fraction = starving_frac
 
     # ── Taxation ──────────────────────────────────────────────────────────────
@@ -172,52 +125,38 @@ class King:
         self.tax_timer += 1
         if self.tax_timer < TAX_INTERVAL:
             return
-
         self.tax_timer = 0
-
         if not world.storehouses:
             return
 
-        # ── Adaptive kings may skip the whole cycle if starvation is bad ──
         pop           = max(1, len(world.people))
-        starving      = sum(1 for p in world.people if p.isAlive and p.hunger <= 20)
+        starving      = sum(1 for p in world.people
+                            if p.isAlive and p.hunger <= 20
+                            and not getattr(p, 'is_rebel', False))
         starving_frac = starving / pop
 
         if starving_frac >= self.starvation_skip and self.starvation_skip > 0:
-            # King voluntarily waives taxes this cycle
             self._redistribute(world)
             self._adapt_tax_rate(world)
             return
 
-        # ── Adapt before collecting ────────────────────────────────────────
         self._adapt_tax_rate(world)
-
         rebel_dodges = 0
 
         for person in world.people:
-            if not person.isAlive:
+            if not person.isAlive or person is self.person:
                 continue
-            if person is self.person:
-                continue
-
             food_count  = person.total_food_count()
             has_surplus = food_count > self.tax_amount + self.leniency
-
-            # Rebel with food: dodges, king looks weak
             if getattr(person, 'is_rebel', False):
                 if has_surplus:
                     rebel_dodges += 1
                 continue
-
-            # Loyal but poor: skip silently
             if not has_surplus:
                 continue
-
-            # Loyal with surplus: collect
             sh = world.nearest_storehouse(person.x, person.y)
             if sh is None:
                 continue
-
             collected = 0
             for item in ('food', 'harvested', 'meat'):
                 while collected < self.tax_amount and person.has_item(item):
@@ -227,11 +166,9 @@ class King:
                     self.total_taxed += 1
                 if collected >= self.tax_amount:
                     break
-
             if collected > 0:
                 person.loyalty = max(0, person.loyalty + LOYALTY_LOSS_TAXED)
 
-        # Rebel dodges weaken the king's image
         if rebel_dodges > 0:
             for person in world.people:
                 if not person.isAlive or person is self.person:
@@ -244,7 +181,6 @@ class King:
         self._redistribute(world)
 
     def _redistribute(self, world):
-        """Feed the starving from the storehouse."""
         if not world.storehouses:
             return
         for person in world.people:
@@ -262,7 +198,13 @@ class King:
 
     # ── Overthrow check ───────────────────────────────────────────────────────
     def check_overthrow(self, world):
-        threshold = max(1, len(world.people)) * STARVATION_THRESHOLD_PER_PERSON
+        # FIX 2: immune during first N ticks of reign
+        if self.immunity_ticks > 0:
+            return False
+        # FIX 2: only loyal (non-rebel) starvation counts toward overthrow
+        loyal_pop = max(1, sum(1 for p in world.people
+                               if p.isAlive and not getattr(p, 'is_rebel', False)))
+        threshold = loyal_pop * STARVATION_THRESHOLD_PER_PERSON
         return world.starvation_count >= threshold
 
     # ── Per-tick update ───────────────────────────────────────────────────────
@@ -270,6 +212,9 @@ class King:
         if not self.person.isAlive:
             return
         self.reign_ticks += 1
+        # count down immunity
+        if self.immunity_ticks > 0:
+            self.immunity_ticks -= 1
         self.update_build_radius(len(world.people))
         self.collect_taxes(world)
 
@@ -280,13 +225,13 @@ def update_loyalties(world):
     if world.king is None:
         return
     for person in world.people:
-        if not person.isAlive:
-            continue
-        if person is world.king.person:
+        if not person.isAlive or person is world.king.person:
             continue
         if person.hunger <= 20:
             person.loyalty = max(0, person.loyalty + LOYALTY_LOSS_STARVING)
-            world.starvation_count += 1
+            # FIX 2: only non-rebels add to the overthrow starvation counter
+            if not getattr(person, 'is_rebel', False):
+                world.starvation_count += 1
         elif person.hunger > 50:
             person.loyalty = min(100, person.loyalty + LOYALTY_GAIN_WELL_FED)
         person.is_rebel = person.loyalty < LOYALTY_REBEL_THRESHOLD
@@ -299,6 +244,18 @@ def form_council(world):
                   if p.isAlive and p is not getattr(world.king, 'person', None)]
     candidates.sort(key=lambda p: p.intelligence, reverse=True)
     world.council = candidates[:3]
+
+
+def _grant_rebel_amnesty(world):
+    """
+    FIX 2: after a new election, give every rebel a loyalty boost so they
+    don't immediately re-trigger another overthrow.
+    """
+    for p in world.people:
+        if p.isAlive and getattr(p, 'is_rebel', False):
+            p.loyalty = min(100, p.loyalty + REBEL_AMNESTY_LOYALTY_BOOST)
+            # re-evaluate rebel status
+            p.is_rebel = p.loyalty < LOYALTY_REBEL_THRESHOLD
 
 
 def elect_new_king(world, tick_num):
@@ -322,7 +279,10 @@ def elect_new_king(world, tick_num):
 
     world.king             = King(chosen, tick_num)
     world.council          = []
-    world.starvation_count = 0
+    world.starvation_count = 0   # reset counter on new reign
+
+    # FIX 2: amnesty boost so rebels don't instantly re-overthrow
+    _grant_rebel_amnesty(world)
 
     world.succession_log.append((tick_num, chosen.name, 'elected'))
     return world.king

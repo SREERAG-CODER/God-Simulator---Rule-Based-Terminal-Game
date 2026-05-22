@@ -141,8 +141,7 @@ while any(p.isAlive for p in world.people):
     # ── Detect births ─────────────────────────────────────────────────────
     for p in world.people:
         if id(p) not in prev_ids:
-            parent_names = [x.name for x in world.people
-                            if x is not p and x.birth_cooldown > 140]
+            parent_names = getattr(p, 'parent_names', [])
             entry = (tick, p.name, parent_names)
             stats.register_birth(p, parent_names, tick)
             recent_births.append(entry)
