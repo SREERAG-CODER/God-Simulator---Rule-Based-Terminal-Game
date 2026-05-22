@@ -630,7 +630,7 @@ def render_minimap_overlay(surf):
 #  SIMULATION STEP
 # ═══════════════════════════════════════════════════════════════════
 def sim_step():
-    global tick, prev_ids, prev_alive
+    global tick, prev_ids, prev_alive, selected
     tick += 1
     ph = len(world.huts); ps2 = len(world.storehouses)
 
