@@ -4,12 +4,19 @@ from collections import deque
 CHILD_NAMES = [
     "Cain", "Abel", "Seth", "Aya", "Lila", "Ren", "Kael", "Mira",
     "Theo", "Nora", "Eli", "Zara", "Ivan", "Sena", "Oryn", "Deva",
-    "Luna", "Rex", "Vera", "Otto", "Iris", "Hugo", "Rosa", "Leo"
+    "Luna", "Rex", "Vera", "Otto", "Iris", "Hugo", "Rosa", "Leo",
+    "Finn", "Maya", "Axel", "Sia", "Bram", "Lyra", "Cole", "Wren",
 ]
 
 # Intelligence thresholds
 INT_BUILD_HUT        = 80
 INT_BUILD_STOREHOUSE = 100
+
+# ── Reproduction thresholds (lowered for playability) ─────────────────────────
+REPRO_MIN_INTELLIGENCE = 10   # matches starting intelligence
+REPRO_MIN_AGE          = 15   # age increments every 40 ticks, so ~600 ticks to reach
+REPRO_MIN_HEALTH       = 60   # was 70
+REPRO_MIN_HUNGER       = 35   # was 40
 
 # How often a new build site may be proposed (world ticks between attempts)
 BUILD_COOLDOWN_TICKS = 200
@@ -49,10 +56,16 @@ class Person:
         self._xp_pool = 0.0
 
         # ── King / governance fields ──────────────────────────────────────
-        self.is_king    = False          # True only for the crowned ruler
-        self.is_outcast = False          # True for dethroned kings
-        self.loyalty    = 50             # 0–100; below 25 = rebel
-        self.is_rebel   = False          # derived from loyalty each tick
+        self.is_king    = False
+        self.is_outcast = False
+        self.loyalty    = 50          # 0–100; below 25 = rebel
+        self.is_rebel   = False
+
+        # ── Tracking fields (for end-screen stats) ────────────────────────
+        self.total_children  = 0      # incremented when this person reproduces
+        self.total_kills     = 0      # animals hunted
+        self.ticks_alive     = 0      # incremented each tick while alive
+        self.cause_of_death  = None   # set when person dies
 
     # ════════════════════════════════════════════════════════════
     # Inventory helpers
@@ -87,12 +100,14 @@ class Person:
     # Eating
     # ════════════════════════════════════════════════════════════
     def try_eat(self):
-        if self.hunger > 50 and self.health >= 50:
+        # Eat proactively when hunger drops below 70 (not just 50)
+        # so people top up food before becoming dangerously hungry
+        if self.hunger > 70 and self.health >= 80:
             return
         for item_type, hunger_gain, health_gain in [
-            ('harvested', 50, 20),
-            ('food',      40, 15),
-            ('meat',      80, 20),
+            ('meat',      60, 15),
+            ('harvested', 40, 10),
+            ('food',      30, 8),
         ]:
             if self.has_item(item_type):
                 self.remove_item(item_type)
@@ -104,19 +119,33 @@ class Person:
     # Hunger / health / aging
     # ════════════════════════════════════════════════════════════
     def update_hunger(self, tick):
-        if tick % 5 == 0:
-            self.hunger -= 5
+        self.ticks_alive += 1
+        # Hunger drops 2 every 10 ticks → 100 ticks to lose 20 hunger
+        # Full starvation (100→0) takes ~500 ticks, giving time to find food
+        if tick % 10 == 0:
+            self.hunger -= 2
+        # Only lose health when critically starving (hunger=0)
+        # and only 2 HP per tick, so ~50 more ticks to die after hunger hits 0
         if self.hunger <= 0:
-            self.hunger  = 0
-            self.health -= 10
+            self.hunger = 0
+            if tick % 5 == 0:
+                self.health -= 2
         if self.health <= 0:
             self.isAlive = False
+            if self.cause_of_death is None:
+                self.cause_of_death = 'starvation'
             return
         self.try_eat()
 
     def age_up(self, tick):
         if tick % 40 == 0:
             self.age += 1
+            # Old age death: chance increases past age 70
+            if self.age >= 70:
+                death_chance = (self.age - 70) * 0.05
+                if random.random() < death_chance:
+                    self.isAlive = False
+                    self.cause_of_death = 'old age'
 
     def _gain_xp(self, amount):
         if self.intelligence >= 200:
@@ -307,10 +336,6 @@ class Person:
         return False
 
     def _propose_build_site_in_zone(self, world, kind):
-        """
-        Propose a build site.  Loyal people must stay inside the King's build zone.
-        Rebels and people without a King build anywhere.
-        """
         from Building import BuildSite
         MIN_DIST = 8
 
@@ -320,7 +345,6 @@ class Person:
             x = random.randint(1, world.width - 2)
             y = random.randint(1, world.height - 2)
 
-            # ── Enforce build zone for loyal subjects ─────────────────────
             if king is not None and not self.is_rebel:
                 if not king.in_build_zone(x, y):
                     continue
@@ -341,7 +365,6 @@ class Person:
         return None
 
     def propose_build_site(self, world, kind):
-        """Public alias kept for compatibility."""
         return self._propose_build_site_in_zone(world, kind)
 
     def try_contribute_to_build(self, world):
@@ -360,7 +383,6 @@ class Person:
         for site in world.build_sites:
             if site.kind == 'storehouse' and not can_storehouse:
                 continue
-            # Loyal subjects only work on sites inside the King's zone
             if world.king is not None and not self.is_rebel:
                 if not world.king.in_build_zone(site.x, site.y):
                     continue
@@ -513,7 +535,7 @@ class Person:
     # Hunting
     # ════════════════════════════════════════════════════════════
     def hunt(self, world):
-        if not self.isAlive or self.intelligence < 30:
+        if not self.isAlive or self.intelligence < 10:
             return
 
         self.current_task = 'hunting'
@@ -535,6 +557,7 @@ class Person:
                     world.grid[ty][tx].civilization = None
                     world.animals.remove(animal)
                     self.add_to_inventory('meat')
+                    self.total_kills += 1
                     self._gain_xp(1.0 + self.learning_rate * 0.15)
                     self.current_task = 'roaming'
                     return
@@ -548,6 +571,7 @@ class Person:
                         world.grid[ty][tx].civilization = None
                         world.animals.remove(animal)
                         self.add_to_inventory('meat')
+                        self.total_kills += 1
                         self._gain_xp(1.0 + self.learning_rate * 0.15)
                         self.current_task = 'roaming'
                         return
@@ -570,7 +594,7 @@ class Person:
                 tile.terrain = 'grass'
 
     def try_plant(self, world):
-        if not self.has_item('seed') or self.intelligence < 40:
+        if not self.has_item('seed') or self.intelligence < 20:
             return
         if not self.has_farm:
             self.has_farm = True
@@ -639,7 +663,7 @@ class Person:
             if other is self or not other.isAlive or other.hunger >= 30:
                 continue
             if getattr(other, 'is_outcast', False):
-                continue                        # don't share with outcast kings
+                continue
             if abs(self.x - other.x) + abs(self.y - other.y) <= 1:
                 neighbours.append(other)
         if not neighbours:
@@ -655,29 +679,48 @@ class Person:
 
     # ════════════════════════════════════════════════════════════
     # Reproduction
+    # BUG FIX: lowered thresholds; seek_partner now always runs
+    # then try_reproduce is called unconditionally at tick bottom
     # ════════════════════════════════════════════════════════════
     def seek_partner(self, world):
-        if self.birth_cooldown > 0: return False
-        if self.health < 70 or self.hunger < 40 or self.intelligence < 50: return False
-        if self.age < 15: return False
-        if len(world.people) >= world.population_cap: return False
+        """Move toward the nearest eligible partner. Returns True if already adjacent."""
+        if self.birth_cooldown > 0:
+            return False
+        if self.health < REPRO_MIN_HEALTH or self.hunger < REPRO_MIN_HUNGER:
+            return False
+        if self.intelligence < REPRO_MIN_INTELLIGENCE:
+            return False
+        if self.age < REPRO_MIN_AGE:
+            return False
+        if len(world.people) >= world.population_cap:
+            return False
 
         best, best_dist = None, float('inf')
         for other in world.people:
-            if other is self or not other.isAlive: continue
-            if other.birth_cooldown > 0: continue
-            if other.health < 70 or other.hunger < 40 or other.intelligence < 50: continue
-            if other.age < 15: continue
+            if other is self or not other.isAlive:
+                continue
+            if other.birth_cooldown > 0:
+                continue
+            if other.health < REPRO_MIN_HEALTH or other.hunger < REPRO_MIN_HUNGER:
+                continue
+            if other.intelligence < REPRO_MIN_INTELLIGENCE:
+                continue
+            if other.age < REPRO_MIN_AGE:
+                continue
             dist = abs(self.x - other.x) + abs(self.y - other.y)
             if dist <= 2:
-                return True
+                return True   # already adjacent — try_reproduce will fire below
             if dist < best_dist:
                 best_dist = dist
                 best      = other
 
-        if best is None: return False
+        if best is None:
+            return False
+
+        # Move one step toward best partner
         step = self._find_path_step(world, best.x, best.y)
-        if step is None: return False
+        if step is None:
+            return False
         ox, oy = step
         nx, ny = self.x + ox, self.y + oy
         tile   = world.grid[ny][nx]
@@ -688,29 +731,44 @@ class Person:
             world.grid[self.y][self.x].civilization = None
             self.x, self.y = nx, ny
             world.grid[self.y][self.x].civilization = self
-            self.current_task = 'seeking'
-            return True
+            self.current_task = 'seeking_partner'
+            return False   # still moving — not yet adjacent
         return False
 
     def try_reproduce(self, world):
-        if not self.isAlive or self.birth_cooldown > 0: return None
-        if self.health < 70 or self.hunger < 40: return None
-        if self.intelligence < 50 or self.age < 15: return None
-        if len(world.people) >= world.population_cap: return None
+        """Attempt to produce a child with an adjacent eligible partner."""
+        if not self.isAlive or self.birth_cooldown > 0:
+            return None
+        if self.health < REPRO_MIN_HEALTH or self.hunger < REPRO_MIN_HUNGER:
+            return None
+        if self.intelligence < REPRO_MIN_INTELLIGENCE:
+            return None
+        if self.age < REPRO_MIN_AGE:
+            return None
+        if len(world.people) >= world.population_cap:
+            return None
 
         for other in world.people:
-            if other is self or not other.isAlive: continue
-            if other.birth_cooldown > 0: continue
-            if other.health < 70 or other.hunger < 40: continue
-            if other.intelligence < 50 or other.age < 15: continue
-            if abs(self.x - other.x) + abs(self.y - other.y) > 2: continue
+            if other is self or not other.isAlive:
+                continue
+            if other.birth_cooldown > 0:
+                continue
+            if other.health < REPRO_MIN_HEALTH or other.hunger < REPRO_MIN_HUNGER:
+                continue
+            if other.intelligence < REPRO_MIN_INTELLIGENCE:
+                continue
+            if other.age < REPRO_MIN_AGE:
+                continue
+            if abs(self.x - other.x) + abs(self.y - other.y) > 2:
+                continue
 
+            # Find free tile for child
             child_pos = None
             for dx, dy in random.sample([(0,-1),(0,1),(-1,0),(1,0)], 4):
                 cx, cy = self.x + dx, self.y + dy
                 if 0 <= cx < world.width and 0 <= cy < world.height:
                     t = world.grid[cy][cx]
-                    if t.terrain == 'grass' and t.civilization is None:
+                    if t.terrain in ('grass', 'food', 'seed') and t.civilization is None:
                         child_pos = (cx, cy)
                         break
             if child_pos is None:
@@ -728,8 +786,13 @@ class Person:
 
             self.birth_cooldown  = 150
             other.birth_cooldown = 150
+            self.total_children  += 1
 
             cx, cy = child_pos
+            # Clear food/seed tile if necessary
+            if world.grid[cy][cx].terrain in ('food', 'seed'):
+                world.grid[cy][cx].terrain = 'grass'
+
             child  = Person(child_name, cx, cy, intelligence=child_intel, learning_rate=child_lr)
             world.grid[cy][cx].civilization = child
             world.people.append(child)
@@ -753,6 +816,9 @@ class Person:
                     if tile.terrain == 'food':
                         self.add_to_inventory('food')
                         tile.terrain = 'grass'
+                    elif tile.terrain == 'seed':
+                        self.add_to_inventory('seed')
+                        tile.terrain = 'grass'
                     world.grid[self.y][self.x].civilization = None
                     self.x, self.y = nx, ny
                     world.grid[self.y][self.x].civilization = self
@@ -761,6 +827,9 @@ class Person:
 
     # ════════════════════════════════════════════════════════════
     # MAIN TICK
+    # BUG FIX: seek_partner no longer gates try_reproduce.
+    # try_reproduce is always attempted at the end of the tick
+    # when conditions are met.
     # ════════════════════════════════════════════════════════════
     def tick(self, world, tick_num):
         self.update_hunger(tick_num)
@@ -773,20 +842,23 @@ class Person:
 
         old_inv = self.inventory[:]
 
-        # ── Survival first: eat / hunt if starving ────────────────────────
-        if self.hunger < 30 and not self.has_edible_food():
+        # ── Survival first: hunt / forage when getting hungry ────────────
+        # Trigger at hunger < 50 so they seek food well before starving
+        if self.hunger < 50 and not self.has_edible_food():
             if not self.try_withdraw_from_storehouse(world):
                 self.hunt(world)
-                if self.current_task == 'hunting':
-                    self.move(world, tick_num)
+                self.move(world, tick_num)
+            self._try_reproduce_end(world)
             return old_inv
 
         # ── Seek hut if injured ───────────────────────────────────────────
         if self.try_seek_hut(world):
+            self._try_reproduce_end(world)
             return old_inv
 
         # ── Deposit surplus food to storehouse ────────────────────────────
         if self.try_deposit_to_storehouse(world):
+            self._try_reproduce_end(world)
             return old_inv
 
         # ── Building takes priority over farming when smart enough ────────
@@ -794,9 +866,7 @@ class Person:
                 tick_num % 3 == (hash(self.name) % 3)):
             if self.try_contribute_to_build(world):
                 self.try_share_food(world)
-                if (self.health >= 70 and self.hunger >= 40 and
-                        self.birth_cooldown == 0 and self.age >= 15):
-                    self.try_reproduce(world)
+                self._try_reproduce_end(world)
                 return old_inv
 
         # ── Farming pipeline ──────────────────────────────────────────────
@@ -805,20 +875,32 @@ class Person:
             if self.current_task != 'harvesting':
                 self.try_collect_seed(world)
                 self.try_plant(world)
-                if not self.seek_partner(world):
-                    if not self.try_strategic_gather(world):
-                        self.move(world, tick_num)
+                # Always try to seek partner AND move; seeking partner no longer
+                # blocks movement via a guard condition
+                self.seek_partner(world)
+                if not self.try_strategic_gather(world):
+                    self.move(world, tick_num)
         else:
             self.try_collect_seed(world)
             self.try_plant(world)
-            if not self.seek_partner(world):
-                if not self.try_strategic_gather(world):
-                    self.move(world, tick_num)
+            self.seek_partner(world)
+            if not self.try_strategic_gather(world):
+                self.move(world, tick_num)
 
         # ── Social actions ────────────────────────────────────────────────
         self.try_share_food(world)
-        if (self.health >= 70 and self.hunger >= 40 and
-                self.birth_cooldown == 0 and self.age >= 15):
-            self.try_reproduce(world)
+        self._try_reproduce_end(world)
 
         return old_inv
+
+    def _try_reproduce_end(self, world):
+        """
+        Called at the end of every tick branch.
+        Unconditionally attempts reproduction — does NOT depend on seek_partner.
+        """
+        if (self.health >= REPRO_MIN_HEALTH and
+                self.hunger >= REPRO_MIN_HUNGER and
+                self.birth_cooldown == 0 and
+                self.age >= REPRO_MIN_AGE and
+                self.intelligence >= REPRO_MIN_INTELLIGENCE):
+            self.try_reproduce(world)
