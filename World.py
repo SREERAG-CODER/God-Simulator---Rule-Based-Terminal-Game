@@ -4,14 +4,27 @@ from Civilization import Person
 from Animal import Animal
 from Building import BuildSite, Hut, Storehouse
 
+# ── Population cap constants ──────────────────────────────────────────────────
+BASE_POP_CAP          = 10    # starting cap before any buildings
+POP_CAP_PER_HUT       = 5    # each completed hut adds this
+# Storehouse food scaling: for every FOOD_PER_POP food stored across all
+# storehouses, the cap rises by 1 (up to STOREHOUSE_POP_CAP_MAX bonus)
+FOOD_PER_POP          = 8
+STOREHOUSE_POP_CAP_MAX = 30
+
+
 class World:
-    def __init__(self, width, height, population_cap=10):
+    def __init__(self, width, height, population_cap=BASE_POP_CAP):
         self.width          = width
         self.height         = height
         self.grid           = [[Tile('grass') for _ in range(width)] for _ in range(height)]
         self.people         = []
         self.animals        = []
-        self.population_cap = population_cap
+
+        # Base cap is stored separately so we can recompute dynamically
+        self._base_pop_cap  = population_cap
+        self._hut_pop_bonus = 0          # cumulative bonus from completed huts
+        self.population_cap = population_cap   # recomputed each tick
 
         # Buildings
         self.huts           = []        # list of Hut
@@ -20,6 +33,23 @@ class World:
 
         self.generate_terrain()
         self.spawn_animals()
+
+    # ── Population cap ───────────────────────────────────────────────────────
+    def recompute_population_cap(self):
+        """
+        Call once per tick.  Cap = base + hut bonus + storehouse food bonus.
+        Storehouse bonus: floor(total_stored_food / FOOD_PER_POP), capped at
+        STOREHOUSE_POP_CAP_MAX.  This means keeping storehouses well-stocked
+        meaningfully raises how many people the world can sustain.
+        """
+        total_food = sum(sh.food_count() for sh in self.storehouses)
+        food_bonus = min(STOREHOUSE_POP_CAP_MAX, total_food // FOOD_PER_POP)
+        self.population_cap = self._base_pop_cap + self._hut_pop_bonus + food_bonus
+
+    def storehouse_food_bonus(self):
+        """Return current food-driven population bonus (for display)."""
+        total_food = sum(sh.food_count() for sh in self.storehouses)
+        return min(STOREHOUSE_POP_CAP_MAX, total_food // FOOD_PER_POP)
 
     # ── Terrain generation ───────────────────────────────────────────────────
     def generate_terrain(self):
@@ -139,12 +169,16 @@ class World:
         if site.kind == 'hut':
             building = Hut(x, y)
             self.huts.append(building)
-            self.population_cap += Hut.POP_BONUS
+            # Accumulate hut bonus separately; recompute_population_cap will apply it
+            self._hut_pop_bonus += Hut.POP_BONUS
             self.grid[y][x].civilization = building
         elif site.kind == 'storehouse':
             building = Storehouse(x, y)
             self.storehouses.append(building)
             self.grid[y][x].civilization = building
+
+        # Immediately recompute so the cap is current
+        self.recompute_population_cap()
 
     def apply_hut_healing(self):
         for hut in self.huts:
@@ -182,6 +216,9 @@ class World:
                 best_dist = d
                 best      = site
         return best
+
+    def total_stored_food(self):
+        return sum(sh.food_count() for sh in self.storehouses)
 
     # ── Animals ──────────────────────────────────────────────────────────────
     def spawn_animals(self, count=12):

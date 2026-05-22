@@ -12,12 +12,11 @@ def draw_bar(label, value, max_value=100, length=15):
 class Stats:
     def __init__(self):
         self.total_born        = 0
-        self.births_log        = []   # (tick, child_name, parent_names)
-        self.deaths_log        = []   # (tick, name, age, cause)
+        self.births_log        = []
+        self.deaths_log        = []
         self.peak_population   = 0
         self.huts_built        = 0
         self.storehouses_built = 0
-        # per-person lifetime stats: name → dict
         self.person_stats      = {}
 
     def register_person(self, person):
@@ -26,10 +25,11 @@ class Stats:
                 'wood': 0, 'stone': 0, 'fiber': 0,
                 'food': 0, 'meat': 0, 'harvested': 0,
                 'births': 0, 'max_age': 0, 'max_intel': 0,
+                'born_tick': 0, 'death_tick': None,
+                'learning_rate': person.learning_rate,
             }
 
     def snapshot(self, person):
-        """Call each tick to update peak intel/age."""
         s = self.person_stats.get(person.name)
         if s is None:
             return
@@ -37,7 +37,6 @@ class Stats:
         s['max_intel'] = max(s['max_intel'], person.intelligence)
 
     def record_inventory_gains(self, person, old_inv):
-        """Diff inventory before/after a tick and credit new items to person stats."""
         s = self.person_stats.get(person.name)
         if s is None:
             return
@@ -52,7 +51,7 @@ class Stats:
 stats = Stats()
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
-world = World(50, 50, population_cap=20)
+world = World(50, 50, population_cap=10)
 adam  = world.spawn_person("Adam")
 stats.register_person(adam)
 stats.total_born += 1
@@ -75,7 +74,7 @@ for _ in range(1000):
 world.seed_food_near(adam.x, adam.y, radius=8, count=12)
 
 tick          = 0
-recent_births = []   # last 5 for live display
+recent_births = []
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 while any(p.isAlive for p in world.people):
@@ -89,7 +88,7 @@ while any(p.isAlive for p in world.people):
 
     for person in list(world.people):
         if person.isAlive:
-            old_inv = person.tick(world, tick)   # ← all behaviour now in Person.tick()
+            old_inv = person.tick(world, tick)
             stats.record_inventory_gains(person, old_inv)
             stats.snapshot(person)
 
@@ -104,6 +103,9 @@ while any(p.isAlive for p in world.people):
             if len(recent_births) > 5:
                 recent_births.pop(0)
             stats.register_person(p)
+            s = stats.person_stats.get(p.name)
+            if s:
+                s['born_tick'] = tick
 
     # ── Detect deaths ─────────────────────────────────────────────────────────
     for p in world.people:
@@ -112,7 +114,8 @@ while any(p.isAlive for p in world.people):
             stats.deaths_log.append((tick, p.name, p.age, cause))
             s = stats.person_stats.get(p.name)
             if s:
-                s['max_age'] = p.age
+                s['max_age']   = p.age
+                s['death_tick'] = tick
 
     # ── Detect new buildings ──────────────────────────────────────────────────
     stats.huts_built        += len(world.huts)        - prev_huts
@@ -125,15 +128,21 @@ while any(p.isAlive for p in world.people):
     if tick % 50 == 0:
         world.respawn_animals()
     world.apply_hut_healing()
+    world.recompute_population_cap()   # ← dynamic cap update each tick
     world.prune_dead()
 
     # ── Live display ──────────────────────────────────────────────────────────
-    alive_people = [p for p in world.people if p.isAlive]
-    pop          = len(alive_people)
+    alive_people  = [p for p in world.people if p.isAlive]
+    pop           = len(alive_people)
     stats.peak_population = max(stats.peak_population, pop)
 
+    hut_bonus   = world._hut_pop_bonus
+    food_bonus  = world.storehouse_food_bonus()
+    stored_food = world.total_stored_food()
+
     print(f"  ╔══════════════════════════════════════════════════════════╗")
-    print(f"  ║  TICK: {tick:<6}  |  Population: {pop}/{world.population_cap}  Peak: {stats.peak_population}          ║")
+    print(f"  ║  TICK: {tick:<6}  |  Pop: {pop}/{world.population_cap}  Peak: {stats.peak_population:<5}          ║")
+    print(f"  ║  Cap breakdown: base={world._base_pop_cap} + huts={hut_bonus} + food={food_bonus} (stored:{stored_food})   ║")
     print(f"  ╠══════════════════════════════════════════════════════════╣")
 
     for p in alive_people:
@@ -145,9 +154,10 @@ while any(p.isAlive for p in world.people):
         inv_st = p.inventory_count('stone')
         inv_fi = p.inventory_count('fiber')
         cd     = f" CD:{p.birth_cooldown}" if p.birth_cooldown > 0 else ""
-        print(f"  ║  {p.name:<6} A:{p.age:<3} I:{p.intelligence:<3}{cd:<7}")
+        gc     = f" GC:{p.gather_cooldown}" if p.gather_cooldown > 0 else ""
+        print(f"  ║  {p.name:<6} A:{p.age:<3} I:{p.intelligence:<3} LR:{p.learning_rate}{cd:<7}{gc}")
         print(f"  ║    {draw_bar('HP', p.health)}  {draw_bar('HG', p.hunger)}")
-        print(f"  ║    Task:{p.current_task:<14} Inv[{len(p.inventory)}/25]")
+        print(f"  ║    Task:{p.current_task:<18} Inv[{len(p.inventory)}/25]")
         print(f"  ║    Food: F={inv_f} M={inv_m} H={inv_h} S={inv_s}  |  Res: W={inv_w} St={inv_st} Fi={inv_fi}")
         print(f"  ║    Farm:{'Yes' if p.has_farm else 'No':<4} Full:{'Yes' if p.farm_full else 'No':<4}")
         print(f"  ╠══════════════════════════════════════════════════════════╣")
@@ -185,26 +195,27 @@ print(f"""
 if longest:
     print(f"  ║  Longest lived:   {longest.name} (Age {longest.age})")
 
-# ── Per-person summary ────────────────────────────────────────────────────────
 print(f"  ╠══════════════════════════════════════════════════════════════╣")
 print(f"  ║  PERSON SUMMARIES                                           ║")
 print(f"  ╠══════════════════════════════════════════════════════════════╣")
 for name, s in stats.person_stats.items():
     total_food = s['food'] + s['harvested'] + s['meat']
     total_res  = s['wood'] + s['stone'] + s['fiber']
-    print(f"  ║  {name:<8}  Age:{s['max_age']:<4} Intel:{s['max_intel']:<4}")
+    born_str  = f"tick {s['born_tick']}" if s['born_tick'] else "start"
+    death_str = f"tick {s['death_tick']}" if s['death_tick'] else "survived"
+    lifespan  = (s['death_tick'] or tick) - s['born_tick']
+    print(f"  ║  {name:<8}  Born:{born_str:<10} Died:{death_str:<12} Lifespan:{lifespan} ticks")
+    print(f"  ║    Age at death:{s['max_age']:<4}  Intel at death:{s['max_intel']:<4}  LearningRate:{s['learning_rate']}")
     print(f"  ║    Food gathered : food={s['food']} harvested={s['harvested']} meat={s['meat']} (total={total_food})")
     print(f"  ║    Res gathered  : wood={s['wood']} stone={s['stone']} fiber={s['fiber']} (total={total_res})")
     print(f"  ╠══════════════════════════════════════════════════════════╣")
 
-# ── Full births log ───────────────────────────────────────────────────────────
 print(f"  ║  FULL BIRTHS LOG                                            ║")
 print(f"  ╠══════════════════════════════════════════════════════════════╣")
 for bt, bname, bparents in stats.births_log:
     pstr = ' & '.join(bparents) if bparents else '?'
     print(f"  ║    Tick {bt:<6}: {bname:<8} (parents: {pstr})")
 
-# ── Deaths log ────────────────────────────────────────────────────────────────
 if stats.deaths_log:
     print(f"  ╠══════════════════════════════════════════════════════════╣")
     print(f"  ║  DEATHS LOG                                                 ║")
